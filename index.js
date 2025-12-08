@@ -594,4 +594,4 @@ client.on("messageCreate", (msg) => {
 // =============================
 // PUT YOUR BOT TOKEN HERE
 // =============================
-client.login(process.env.MTQ0NjI1MjY3NjkyODI0NTk2NA.GXqW5d.M3T4mFgYB-luKWV-aoPHybYWzvJyhri78NxkHQ);
+client.login(process.env.BOT_TOKEN)
