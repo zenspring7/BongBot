@@ -2,13 +2,29 @@ const fs = require("fs");
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 
 // =============================
-// 420 ALERT CHANNEL
+// CONFIG
 // =============================
-const ALERT_CHANNEL_ID = "757698153494609943"; // your 420 channel ID
+const ALERT_CHANNEL_ID = "757698153494609943";
 
-// All the fun ways to say a "rip"
+// XP + leveling
+const XP_PER_RIP = 420;        // normal rip XP
+const XP_DAB_RIP = 710;        // dab XP
+const XP_EDDY_RIP = 840;       // eddys XP
+const XP_JOINT_RIP = 840;      // joint XP
+const XP_CRIT_RIP = 4269;      // crit XP (non-dab)
+const XP_DAB_CRIT_RIP = 7100;  // crit dab XP
+
+const XP_PER_LEVEL = 6969;
+const MAX_LEVEL = 100;
+const MAX_PRESTIGE = 10;
+
+const BASE_CRIT_CHANCE = 0.01;
+const CRIT_CHANCE_CAP = 1.0;
+const DAB_CRIT_MULTIPLIER = 3;
+
+// Trigger words
 const RIP_VARIANTS = [
-  // Bong / Zong / Dong / Zonk style
+  // Bong-ish
   "bong rip", "bong rips", "bong ripz",
   "b0ng rip", "b0ng rips", "b0ng ripz",
   "b0nk rip", "b0nk rips", "b0nk ripz",
@@ -19,42 +35,31 @@ const RIP_VARIANTS = [
   "zonk rip", "zonk rips", "zonk ripz",
   "z0nk rip", "z0nk rips", "z0nk ripz",
 
-  // Pen / penjamin / smoke phrases
+  // Pen / smoke
   "pen rip", "pen rips", "pen rippers",
   "penjamin rip", "penjamin rips",
   "light up", "smoke", "smoke up",
 
-  // Extra rip terms
-  "ripper",
-  "rippers",
-  "get high",
-  "get high baby",
-  "get high baby yeah",
+  // Generic rip words
+  "rip", "rips", "ripper", "rippers",
+  "get high", "get high baby", "get high baby yeah",
 
-  // Dab variants
-  "dabs",
-  "dab rip",
-  "dab rips",
-  "fat dabs",
-  "fat dabs for jesus",
+  // Dabs
+  "dabs", "dab rip", "dab rips", "fat dabs", "fat dabs for jesus",
 
-  // Eddy variant
-  "eddys"
+  // Eddys
+  "eddys",
+
+  // Joints
+  "joint", "doobie", "doink",
+  "joint time", "doobie time",
+  "smokin a doobie", "smokin a joint", "smokin a doink",
+  "doink30", "joint30", "doobie30"
 ];
 
-const XP_PER_RIP = 420;        // normal rip XP (includes pen, bong, etc.)
-const XP_DAB_RIP = 710;        // dab XP
-const XP_EDDY_RIP = 840;       // eddys XP
-const XP_CRIT_RIP = 4269;      // critical rip XP
-const XP_PER_LEVEL = 6969;
-const MAX_LEVEL = 100;
-const MAX_PRESTIGE = 10;
-
-const BASE_CRIT_CHANCE = 0.01;       // 1% base crit chance
-const CRIT_CHANCE_CAP = 1.0;         // cap at 100%
-const DAB_CRIT_MULTIPLIER = 3;       // dabs get 3x crit chance per roll (for the check)
-
-// Discord client
+// =============================
+// DISCORD CLIENT
+// =============================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -63,6 +68,9 @@ const client = new Client({
   ]
 });
 
+// =============================
+// STORAGE
+// =============================
 let data = {
   daily: 0,
   weekly: 0,
@@ -72,18 +80,17 @@ let data = {
   lastWeekStart: null,
   lastMonth: null,
   lastYear: null,
-  highscores: [],   // top 3 global days (by total rips)
-  userStats: {}     // { userId: { xp, level, totalRips, lastRipDate, streak, longestStreak, prestige, critChance } }
+  highscores: [],
+  userStats: {}
 };
 
-// Load saved data if it exists
 if (fs.existsSync("bongData.json")) {
   try {
-    const file = JSON.parse(fs.readFileSync("bongData.json"));
+    const file = JSON.parse(fs.readFileSync("bongData.json", "utf8"));
     data = { ...data, ...file };
     if (!data.userStats) data.userStats = {};
   } catch (err) {
-    console.log("Error reading bongData.json, using defaults:", err);
+    console.error("Error reading bongData.json, using defaults:", err);
   }
 }
 
@@ -91,13 +98,42 @@ function save() {
   fs.writeFileSync("bongData.json", JSON.stringify(data, null, 2));
 }
 
-function getToday() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+// =============================
+// TIMEZONE HELPERS (FIXES RAILWAY UTC PROBLEM)
+// =============================
+// Gets hour/minute/day-of-week for a specific IANA timezone reliably.
+function getZonedParts(timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    weekday: "short"
+  });
+
+  const parts = dtf.formatToParts(new Date());
+  const get = (type) => parts.find(p => p.type === type)?.value;
+
+  const hour = parseInt(get("hour"), 10);
+  const minute = parseInt(get("minute"), 10);
+
+  const weekday = get("weekday"); // "Mon", "Tue", ...
+  const dowMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const dow = dowMap[weekday] ?? null;
+
+  return { hour, minute, dow };
 }
 
-function getWeekStart() {
+// =============================
+// RESET HELPERS
+// =============================
+function getTodayString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getCurrentWeekStartString() {
   const now = new Date();
-  const day = now.getDay(); // 0 = Sunday
+  const day = now.getDay(); // Sunday=0
   const sunday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day);
   return sunday.toISOString().slice(0, 10);
 }
@@ -111,8 +147,8 @@ function updateHighscores(date, count) {
 
 function checkResets() {
   const now = new Date();
-  const today = getToday();
-  const weekStart = getWeekStart();
+  const today = getTodayString();
+  const weekStart = getCurrentWeekStartString();
 
   // Daily + highscores
   if (data.lastDate !== today) {
@@ -123,7 +159,7 @@ function checkResets() {
     data.lastDate = today;
   }
 
-  // Weekly (Sun–Sat)
+  // Weekly
   if (data.lastWeekStart !== weekStart) {
     data.weekly = 0;
     data.lastWeekStart = weekStart;
@@ -144,64 +180,53 @@ function checkResets() {
   save();
 }
 
-// Detect whether a message should count as a "rip"
+// =============================
+// RIP DETECTION
+// =============================
 function messageHasRip(content) {
   const txt = content.toLowerCase();
 
-  // bong / zong / dong style rips
   const bongRegex = /\b(?:b|z|d)(?:o|0)(?:ng|nk)\s+rip[sz]?\b/;
+  const ripRegex = /\brips?\b/;
 
-  // extra trigger phrases
-  const extraTriggers = [
-    "zonk rip", "zonk rips", "zonk ripz",
-    "z0nk rip", "z0nk rips", "z0nk ripz",
-    "pen rip", "pen rips", "pen rippers",
-    "penjamin rip", "penjamin rips",
-    "light up", "smoke", "smoke up",
-    "ripper",
-    "rippers",
-    "get high",
-    "get high baby",
-    "get high baby yeah",
-    "dabs",
-    "dab rip",
-    "dab rips",
-    "fat dabs",
-    "fat dabs for jesus",
-    "eddys"
-  ];
-
-  return bongRegex.test(txt) || extraTriggers.some(t => txt.includes(t));
+  return (
+    bongRegex.test(txt) ||
+    ripRegex.test(txt) ||
+    RIP_VARIANTS.some(t => txt.includes(t))
+  );
 }
 
 function isDabRip(content) {
   const txt = content.toLowerCase();
-  const dabTriggers = [
-    "dabs",
-    "dab rip",
-    "dab rips",
-    "fat dabs",
-    "fat dabs for jesus"
-  ];
-  return dabTriggers.some(t => txt.includes(t));
+  return ["dabs", "dab rip", "dab rips", "fat dabs", "fat dabs for jesus"].some(t => txt.includes(t));
 }
 
 function isEddyRip(content) {
+  return content.toLowerCase().includes("eddys");
+}
+
+function isJointRip(content) {
   const txt = content.toLowerCase();
-  return txt.includes("eddys");
+  return [
+    "joint", "doobie", "doink",
+    "joint time", "doobie time",
+    "smokin a doobie", "smokin a joint", "smokin a doink",
+    "doink30", "joint30", "doobie30"
+  ].some(t => txt.includes(t));
 }
 
 function isBongishRip(content) {
   const txt = content.toLowerCase();
-  return /\b(?:b|z|d)(?:o|0)(?:ng|nk)\s+rip[sz]?\b/.test(txt) ||
+  return (
+    /\b(?:b|z|d)(?:o|0)(?:ng|nk)\s+rip[sz]?\b/.test(txt) ||
     txt.includes("zonk rip") || txt.includes("zonk rips") || txt.includes("zonk ripz") ||
-    txt.includes("z0nk rip") || txt.includes("z0nk rips") || txt.includes("z0nk ripz");
+    txt.includes("z0nk rip") || txt.includes("z0nk rips") || txt.includes("z0nk ripz")
+  );
 }
 
 function isPenRip(content) {
   const txt = content.toLowerCase();
-  return txt.includes("pen rip") || txt.includes("pen rips") ||
-         txt.includes("pen rippers") || txt.includes("penjamin");
+  return txt.includes("pen rip") || txt.includes("pen rips") || txt.includes("pen rippers") || txt.includes("penjamin");
 }
 
 function randomElement(arr) {
@@ -211,30 +236,24 @@ function randomElement(arr) {
 function pickCategoryPhrase(content) {
   const txt = content.toLowerCase();
 
-  const bongPhrases = [
-    "bong rip", "zong rip", "dong rip", "zonk rip", "fat bong rip", "gnarly bong rip"
-  ];
-  const dabPhrases = [
-    "dab rip", "fat dabs", "710 blast", "terpy dab"
-  ];
-  const penPhrases = [
-    "pen rip", "penjamin rip", "cart rip"
-  ];
-  const eddyPhrases = [
-    "eddys", "eddy rip"
-  ];
-  const genericPhrases = [
-    "rip", "big rip", "mega rip", "cosmic rip"
-  ];
+  const bongPhrases = ["bong rip", "zong rip", "dong rip", "zonk rip", "gnarly bong rip"];
+  const dabPhrases = ["dab rip", "fat dabs", "710 blast", "terpy dab"];
+  const penPhrases = ["pen rip", "penjamin rip", "cart rip"];
+  const eddyPhrases = ["eddys", "eddy rip"];
+  const jointPhrases = ["joint", "doobie", "doink", "doobie time", "joint time"];
+  const genericPhrases = ["rip", "big rip", "mega rip", "cosmic rip"];
 
   if (isDabRip(txt)) return randomElement(dabPhrases);
   if (isEddyRip(txt)) return randomElement(eddyPhrases);
+  if (isJointRip(txt)) return randomElement(jointPhrases);
   if (isBongishRip(txt)) return randomElement(bongPhrases);
   if (isPenRip(txt)) return randomElement(penPhrases);
   return randomElement(genericPhrases);
 }
 
-// User helpers
+// =============================
+// USER STATS
+// =============================
 function ensureUser(userId) {
   if (!data.userStats[userId]) {
     data.userStats[userId] = {
@@ -267,10 +286,10 @@ function isYesterday(dateStr, todayStr) {
   const d = new Date(dateStr);
   const t = new Date(todayStr);
   const diff = (t - d) / (1000 * 60 * 60 * 24);
-  return diff >= 0.9 && diff <= 1.1; // ~1 day
+  return diff >= 0.9 && diff <= 1.1;
 }
 
-function formatTopRippers(limit = 5) {
+function formatTopRippers(limit = 10) {
   const entries = Object.entries(data.userStats);
   if (!entries.length) return null;
 
@@ -279,7 +298,7 @@ function formatTopRippers(limit = 5) {
     .slice(0, limit);
 
   const lines = sorted.map(([id, stats], i) => {
-    return `**${i + 1}.** <@${id}> — **${stats.totalRips} rips**, Level **${stats.level}**, Prestige **${stats.prestige}** (${stats.xp} XP)`;
+    return `**${i + 1}.** <@${id}> — **${stats.totalRips} rips**, Lvl **${stats.level}**, P **${stats.prestige}**`;
   });
 
   return "🏆 **Top Rippers**\n" + lines.join("\n");
@@ -289,56 +308,56 @@ function isAdmin(member) {
   return !!member && member.permissions?.has(PermissionsBitField.Flags.Administrator);
 }
 
-// --------------------------
-// Bot events
-// --------------------------
+// =============================
+// READY
+// =============================
 client.on("ready", () => {
   console.log(`🔥 Bot online as ${client.user.tag}`);
   checkResets();
 
-  // 3:20, 4:20, 5:20, 6:20 city-based alerts + Saturday leaderboard at 4:20
+  // Timezone-correct 4:20 alerts (no more UTC nonsense)
+  // We fire when EACH city hits 4:20 locally.
   setInterval(() => {
-    const now = new Date();
-    const dow = now.getDay(); // 0 Sunday, 6 Saturday
-    const hour = now.getHours();
-    const minute = now.getMinutes();
-
     const channel = client.channels.cache.get(ALERT_CHANNEL_ID);
     if (!channel) return;
 
-    // 3:20 — Cincinnati
-    if (hour === 15 && minute === 20) {
+    const cincinnati = getZonedParts("America/New_York");
+    const iowaCity   = getZonedParts("America/Chicago");
+    const denver     = getZonedParts("America/Denver");
+    const la         = getZonedParts("America/Los_Angeles");
+
+    // Cincinnati 4:20
+    if (cincinnati.hour === 16 && cincinnati.minute === 20) {
       channel.send("🔥💨 **IT'S 4:20 IN CINCINNATI — SPARK UP BOYS** 💨🔥");
     }
 
-    // 4:20 — Iowa City + Saturday leaderboard
-    if (hour === 16 && minute === 20) {
+    // Iowa City 4:20 (+ Saturday leaderboard)
+    if (iowaCity.hour === 16 && iowaCity.minute === 20) {
       channel.send("🔥💨 **IT'S 4:20 IN IOWA CITY — BLESS UP** 💨🔥");
 
-      // If it's Saturday (dow === 6), also post leaderboard
-      if (dow === 6) {
+      // Saturday in Iowa City time
+      if (iowaCity.dow === 6) {
         const board = formatTopRippers(10);
-        if (board) {
-          channel.send(board);
-        } else {
-          channel.send("🏆 No rippers yet this week. Tragic.");
-        }
+        channel.send(board || "🏆 No rippers logged yet. Fix that.");
       }
     }
 
-    // 5:20 — Denver
-    if (hour === 17 && minute === 20) {
+    // Denver 4:20
+    if (denver.hour === 16 && denver.minute === 20) {
       channel.send("🔥💨 **IT'S 4:20 IN DENVER — TOKE TIME** 💨🔥");
     }
 
-    // 6:20 — Los Angeles
-    if (hour === 18 && minute === 20) {
+    // LA 4:20
+    if (la.hour === 16 && la.minute === 20) {
       channel.send("🔥💨 **IT'S 4:20 IN LOS ANGELES — STAY LIT** 💨🔥");
     }
-  }, 60 * 1000); // check every minute
+  }, 60 * 1000);
 });
 
-client.on("messageCreate", (msg) => {
+// =============================
+// MESSAGE HANDLER
+// =============================
+client.on("messageCreate", async (msg) => {
   if (msg.author.bot) return;
 
   checkResets();
@@ -348,91 +367,143 @@ client.on("messageCreate", (msg) => {
 
   // ---------- COMMANDS ----------
   if (content === "!rips") {
-    msg.reply(
+    await msg.reply(
       `📊 **Global Rip Stats**\n` +
-      `Today: **${data.daily} rips**\n` +
-      `This week: **${data.weekly} rips**\n` +
-      `This month: **${data.monthly} rips**\n` +
-      `This year: **${data.yearly} rips**`
+      `Today: **${data.daily}**\n` +
+      `Week: **${data.weekly}**\n` +
+      `Month: **${data.monthly}**\n` +
+      `Year: **${data.yearly}**`
     );
     return;
   }
 
   if (content === "!ripstats") {
     ensureUser(userId);
-    const user = data.userStats[userId];
-    msg.reply(
+    const u = data.userStats[userId];
+    await msg.reply(
       `👤 **Your Rip Stats**\n` +
-      `Total rips: **${user.totalRips}**\n` +
-      `XP: **${user.xp}**\n` +
-      `Level: **${user.level}**\n` +
-      `Prestige: **${user.prestige}**\n` +
-      `Streak: **${user.streak} days** (Longest: **${user.longestStreak}**)\n` +
-      `Critical chance: **${(user.critChance * 100).toFixed(2)}%**`
+      `Rips: **${u.totalRips}**\n` +
+      `XP: **${u.xp}**\n` +
+      `Level: **${u.level}**\n` +
+      `Prestige: **${u.prestige}**\n` +
+      `Streak: **${u.streak}** (Longest: **${u.longestStreak}**)\n` +
+      `Crit chance: **${(u.critChance * 100).toFixed(2)}%**`
     );
     return;
   }
 
   if (content === "!toprippers") {
     const board = formatTopRippers(10);
-    if (!board) {
-      msg.reply("🏆 No rips logged yet. Shameful.");
-      return;
-    }
-    msg.reply(board);
+    await msg.reply(board || "🏆 No rippers logged yet.");
     return;
   }
 
   if (content === "!mostrips") {
     if (!data.highscores.length) {
-      msg.reply("🏆 No daily rip highscores yet — keep ripping.");
+      await msg.reply("🏆 No daily highscores yet.");
       return;
     }
-
-    const lines = data.highscores.map((h, i) =>
-      `**${i + 1}.** ${h.date}: **${h.count} rips**`
-    );
-    msg.reply("🏆 **Top 3 Rip Days Ever**\n" + lines.join("\n"));
+    const lines = data.highscores.map((h, i) => `**${i + 1}.** ${h.date}: **${h.count}**`);
+    await msg.reply("🏆 **Top 3 Rip Days Ever**\n" + lines.join("\n"));
     return;
   }
 
   // Manual prestige
   if (content === "!prestige") {
     ensureUser(userId);
-    const user = data.userStats[userId];
+    const u = data.userStats[userId];
 
-    if (user.level < MAX_LEVEL) {
-      msg.reply(`⏳ You need to be Level **${MAX_LEVEL}** to prestige. You're only Level **${user.level}**.`);
+    if (u.level < MAX_LEVEL) {
+      await msg.reply(`⏳ You must be Level **${MAX_LEVEL}** to prestige. You're Level **${u.level}**.`);
       return;
     }
-    if (user.prestige >= MAX_PRESTIGE) {
-      msg.reply("🚫 You already hit max Prestige (**10**). Chill, boss.");
+    if (u.prestige >= MAX_PRESTIGE) {
+      await msg.reply("🚫 Max prestige reached (**10**). Absolute legend.");
       return;
     }
 
-    user.prestige += 1;
-    user.level = 1;
-    user.xp = 0;
-    user.critChance = BASE_CRIT_CHANCE;
+    u.prestige += 1;
+    u.level = 1;
+    u.xp = 0;
+    u.critChance = BASE_CRIT_CHANCE;
     save();
 
-    msg.reply(
-      `🌟 **PRESTIGE UNLOCKED!** <@${userId}> is now Prestige **${user.prestige}**, reset to Level 1.\n` +
-      `You have ascended. Again.`
-    );
+    await msg.reply(`🌟 <@${userId}> prestiged to **${u.prestige}** and reset to Level 1.`);
     return;
   }
 
-  // Admin-only: reset user
-  if (content.startsWith("!resetuser")) {
+  // ✅ NEW: Admin-only add XP
+  // Usage: !addexp @user 12345
+  if (content.startsWith("!addexp")) {
     if (!isAdmin(msg.member)) {
-      msg.reply("🚫 You don't have permission to use this command.");
+      await msg.reply("🚫 Admins only.");
       return;
     }
 
     const target = msg.mentions.users.first();
+    const parts = msg.content.trim().split(/\s+/);
+    const amount = parseInt(parts[2], 10);
+
+    if (!target || isNaN(amount)) {
+      await msg.reply("Usage: `!addexp @user <amount>`");
+      return;
+    }
+
+    ensureUser(target.id);
+    const u = data.userStats[target.id];
+
+    u.xp = Math.max(0, u.xp + amount);
+    u.level = calculateLevel(u.xp);
+    save();
+
+    await msg.reply(`✅ Added **${amount} XP** to <@${target.id}>. Now **${u.xp} XP**, Level **${u.level}**.`);
+    return;
+  }
+
+  // ✅ NEW: Admin-only add rips
+  // Usage: !addrips @user 50
+  if (content.startsWith("!addrips")) {
+    if (!isAdmin(msg.member)) {
+      await msg.reply("🚫 Admins only.");
+      return;
+    }
+
+    const target = msg.mentions.users.first();
+    const parts = msg.content.trim().split(/\s+/);
+    const amount = parseInt(parts[2], 10);
+
+    if (!target || isNaN(amount) || amount <= 0) {
+      await msg.reply("Usage: `!addrips @user <amount>`");
+      return;
+    }
+
+    ensureUser(target.id);
+    const u = data.userStats[target.id];
+
+    // Add to user total
+    u.totalRips += amount;
+
+    // Also add to current global counters (so your week/month/year totals line up)
+    data.daily += amount;
+    data.weekly += amount;
+    data.monthly += amount;
+    data.yearly += amount;
+
+    save();
+
+    await msg.reply(`✅ Added **${amount} rips** to <@${target.id}>. They now have **${u.totalRips}** total rips.`);
+    return;
+  }
+
+  // Admin reset user
+  if (content.startsWith("!resetuser")) {
+    if (!isAdmin(msg.member)) {
+      await msg.reply("🚫 Admins only.");
+      return;
+    }
+    const target = msg.mentions.users.first();
     if (!target) {
-      msg.reply("Usage: `!resetuser @user`");
+      await msg.reply("Usage: `!resetuser @user`");
       return;
     }
 
@@ -448,55 +519,47 @@ client.on("messageCreate", (msg) => {
     };
     save();
 
-    msg.reply(
+    await msg.reply(
       `🚨 **CHEATER ALERT** 🚨\n` +
-      `<@${target.id}> just got **HARD RESET** to Level 1, 0 XP, 0 rips.\n` +
-      `Touch some grass, recalibrate your life, then come back and rip legit.`
+      `<@${target.id}> got RESET. Back to **Level 1**, **0 XP**, **0 rips**.\n` +
+      `Bro tried to speedrun the lungs. Not today.`
     );
     return;
   }
 
-  // Admin-only: set level
+  // Admin set level
   if (content.startsWith("!setlevel")) {
     if (!isAdmin(msg.member)) {
-      msg.reply("🚫 You don't have permission to use this command.");
+      await msg.reply("🚫 Admins only.");
       return;
     }
 
-    const parts = content.split(/\s+/);
     const target = msg.mentions.users.first();
-    if (!target || parts.length < 3) {
-      msg.reply("Usage: `!setlevel @user <level>`");
+    const parts = msg.content.trim().split(/\s+/);
+    const lvl = parseInt(parts[2], 10);
+
+    if (!target || isNaN(lvl)) {
+      await msg.reply("Usage: `!setlevel @user <level>`");
       return;
     }
 
-    const levelArg = parts[2];
-    const level = parseInt(levelArg, 10);
-    if (isNaN(level) || level < 1) {
-      msg.reply("Level must be a positive number.");
-      return;
-    }
-
-    const clampedLevel = Math.min(MAX_LEVEL, level);
+    const clamped = Math.max(1, Math.min(MAX_LEVEL, lvl));
     ensureUser(target.id);
-    const user = data.userStats[target.id];
+    const u = data.userStats[target.id];
 
-    user.level = clampedLevel;
-    user.xp = (clampedLevel - 1) * XP_PER_LEVEL;
+    u.level = clamped;
+    u.xp = (clamped - 1) * XP_PER_LEVEL; // put them exactly at that level's base XP
     save();
 
-    msg.reply(
-      `🔧 Set <@${target.id}>'s level to **${clampedLevel}** (${user.xp} XP).\n` +
-      (clampedLevel === MAX_LEVEL ? "They're now at the edge of prestige..." : "")
-    );
+    await msg.reply(`🔧 Set <@${target.id}> to Level **${clamped}** (${u.xp} XP).`);
     return;
   }
 
   // ---------- RIP DETECTION ----------
   if (messageHasRip(content)) {
     ensureUser(userId);
-    const user = data.userStats[userId];
-    const today = getToday();
+    const u = data.userStats[userId];
+    const today = getTodayString();
 
     // Global counters
     data.daily++;
@@ -504,94 +567,76 @@ client.on("messageCreate", (msg) => {
     data.monthly++;
     data.yearly++;
 
-    // Daily streak logic (per user)
+    // Streak bonus (once per day)
     let streakBonusXP = 0;
-    const firstRipToday = user.lastRipDate !== today;
+    const firstRipToday = u.lastRipDate !== today;
 
     if (firstRipToday) {
-      if (isYesterday(user.lastRipDate, today)) {
-        user.streak += 1;
-      } else {
-        user.streak = 1;
-      }
-      user.longestStreak = Math.max(user.longestStreak, user.streak);
-      user.lastRipDate = today;
+      if (isYesterday(u.lastRipDate, today)) u.streak += 1;
+      else u.streak = 1;
 
-      // bonus 420 XP for each day on the streak
+      u.longestStreak = Math.max(u.longestStreak, u.streak);
+      u.lastRipDate = today;
       streakBonusXP = 420;
     }
 
-    // Determine type of rip
     const dabRip = isDabRip(content);
     const eddyRip = isEddyRip(content);
+    const jointRip = isJointRip(content);
 
-    // Critical rip logic with per-user scaling chance
-    const effectiveCritChance = Math.min(
-      user.critChance * (dabRip ? DAB_CRIT_MULTIPLIER : 1),
-      CRIT_CHANCE_CAP
-    );
+    // crit roll (dabs have higher roll chance multiplier)
+    const effectiveCritChance = Math.min(u.critChance * (dabRip ? DAB_CRIT_MULTIPLIER : 1), CRIT_CHANCE_CAP);
     const isCrit = Math.random() < effectiveCritChance;
 
-    if (isCrit) {
-      // Reset crit chance on crit
-      user.critChance = BASE_CRIT_CHANCE;
-    } else {
-      // Triple crit chance on every non-crit rip, capped at 100%
-      user.critChance = Math.min(user.critChance * 3, CRIT_CHANCE_CAP);
-    }
+    if (isCrit) u.critChance = BASE_CRIT_CHANCE;
+    else u.critChance = Math.min(u.critChance * 3, CRIT_CHANCE_CAP);
 
-    // Base XP logic (crit overrides everything, then eddy, then dab, then normal)
+    // XP calc
     let baseXP;
-    if (isCrit) {
-      baseXP = XP_CRIT_RIP;
-    } else if (eddyRip) {
-      baseXP = XP_EDDY_RIP;
-    } else if (dabRip) {
-      baseXP = XP_DAB_RIP;
-    } else {
-      baseXP = XP_PER_RIP;
-    }
+    if (isCrit && dabRip) baseXP = XP_DAB_CRIT_RIP;
+    else if (isCrit) baseXP = XP_CRIT_RIP;
+    else if (eddyRip) baseXP = XP_EDDY_RIP;
+    else if (jointRip) baseXP = XP_JOINT_RIP;
+    else if (dabRip) baseXP = XP_DAB_RIP;
+    else baseXP = XP_PER_RIP;
 
-    let totalGain = baseXP + streakBonusXP;
-    user.totalRips += 1;
-    user.xp += totalGain;
+    const gain = baseXP + streakBonusXP;
 
-    // Level (no auto-prestige; capped at 100)
-    const newLevel = calculateLevel(user.xp);
-    user.level = newLevel;
+    u.totalRips += 1;
+    u.xp += gain;
 
+    u.level = calculateLevel(u.xp); // capped at 100
     save();
 
     const phrase = pickCategoryPhrase(content);
-    const critText = isCrit ? " (**CRITICAL RIP 💥**)" : "";
-    const dabText = !isCrit && dabRip ? " (**DAB RIP 🔥 710 XP base**)" : "";
-    const eddyText = !isCrit && eddyRip ? " (**EDDYS 💫 840 XP base**)" : "";
-    const streakText = user.streak > 1
-      ? `🔥 Streak: **${user.streak} days** (Longest: **${user.longestStreak}**)`
-      : `🔥 Streak: **${user.streak} day**`;
 
-    const prestigeText = user.prestige > 0
-      ? `\n🌟 Prestige: **${user.prestige}**`
+    const critText = isCrit
+      ? (dabRip ? " (**CRITICAL DAB RIP 💥 7100 XP**)" : " (**CRITICAL RIP 💥**)")
       : "";
 
-    const bonusText = streakBonusXP
-      ? ` (+${baseXP} base, +${streakBonusXP} streak bonus)`
-      : ` (+${baseXP})`;
+    const typeText =
+      (!isCrit && dabRip) ? " (**DAB RIP 🔥 710 XP base**)" :
+      (!isCrit && jointRip) ? " (**JOINT ROLL 🌀 840 XP base**)" :
+      (!isCrit && eddyRip) ? " (**EDDYS 💫 840 XP base**)" :
+      "";
 
-    msg.reply(
-      `💨 **${phrase} registered as a rip!**${critText}${dabText}${eddyText}\n` +
-      `👤 You: **${user.totalRips} rips**, **${user.xp} XP**, Level **${user.level}**${bonusText}\n` +
+    const streakText = u.streak > 1
+      ? `🔥 Streak: **${u.streak}** (Longest: **${u.longestStreak}**)`
+      : `🔥 Streak: **${u.streak}**`;
+
+    const prestigeText = u.prestige > 0 ? ` | 🌟 Prestige: **${u.prestige}**` : "";
+
+    await msg.reply(
+      `💨 **${phrase} registered as a rip!**${critText}${typeText}\n` +
+      `👤 You: **${u.totalRips} rips**, **${u.xp} XP**, Level **${u.level}** (+${gain})${prestigeText}\n` +
       `${streakText}\n` +
-      `🎯 Crit chance now: **${(user.critChance * 100).toFixed(2)}%**\n` +
-      `📈 Today: **${data.daily}** | This week: **${data.weekly}** | This month: **${data.monthly}** | This year: **${data.yearly}**` +
-      prestigeText
+      `🎯 Crit chance now: **${(u.critChance * 100).toFixed(2)}%**\n` +
+      `📈 Today: **${data.daily}** | Week: **${data.weekly}** | Month: **${data.monthly}** | Year: **${data.yearly}**`
     );
-
-    return;
   }
 });
 
 // =============================
-// PUT YOUR BOT TOKEN HERE
+// LOGIN (Railway uses BOT_TOKEN variable)
 // =============================
-client.login(process.env.BOT_TOKEN)
+client.login(process.env.BOT_TOKEN);
