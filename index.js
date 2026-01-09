@@ -1,24 +1,26 @@
+// =============================
+// BongBot 2.0 - index.js
+// Node.js + discord.js v14 + Redis
+// =============================
+
+process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
+process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const { createClient } = require("redis");
 
-const ffmpegPath = require("ffmpeg-static");
-process.env.FFMPEG_PATH = ffmpegPath;
+// =============================
+// ENV / FLAGS
+// =============================
+const ENABLE_MUSIC = (process.env.ENABLE_MUSIC || "false").toLowerCase() === "true";
 
+console.log("Booting BongBot 2.0...");
+console.log("ENABLE_MUSIC:", ENABLE_MUSIC);
+console.log("Has BOT_TOKEN:", !!process.env.BOT_TOKEN);
+console.log("Has REDIS_URL:", !!process.env.REDIS_URL);
 
-// Voice / Music (quick way; can break sometimes)
-const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  NoSubscriberBehavior,
-  getVoiceConnection,
-  entersState,
-  VoiceConnectionStatus,
-  StreamType
-} = require("@discordjs/voice");
-
-const playdl = require("play-dl");
+if (!process.env.BOT_TOKEN) throw new Error("BOT_TOKEN missing in Railway variables.");
+if (!process.env.REDIS_URL) throw new Error("REDIS_URL missing in Railway variables (BongBot service).");
 
 // =============================
 // CONFIG
@@ -32,8 +34,16 @@ const MIN_BET = 420;
 // =============================
 // REDIS
 // =============================
-const redis = createClient({ url: process.env.REDIS_URL });
+const redis = createClient({
+  url: process.env.REDIS_URL,
+  socket: process.env.REDIS_URL.startsWith("rediss://")
+    ? { tls: true, rejectUnauthorized: false }
+    : undefined,
+});
+
 redis.on("error", (err) => console.error("Redis error:", err));
+redis.on("connect", () => console.log("Redis connecting..."));
+redis.on("ready", () => console.log("Redis ready ✅"));
 
 const DATA_KEY = "bongbot2:data";
 const ROULETTE_KEY = "bongbot2:roulette";
@@ -45,9 +55,9 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates // required for music
-  ]
+    GatewayIntentBits.MessageContent,   // REQUIRED for prefix commands
+    GatewayIntentBits.GuildVoiceStates // only truly used if music enabled; harmless otherwise
+  ],
 });
 
 // =============================
@@ -111,8 +121,8 @@ function isAdmin(member) {
 // =============================
 // SEASONS
 // =============================
-// This month special: January season starts Jan 9 for 7 days (9..15 inclusive)
-// Every other month: first 7 days of the month (1..7)
+// January special: Jan 9–15 inclusive => endExclusive Jan 16
+// Other months: days 1–7 => endExclusive day 8
 function getSeasonWindowFor(dateObj) {
   const y = dateObj.getFullYear();
   const m = dateObj.getMonth(); // 0-based
@@ -201,7 +211,7 @@ async function maybeUpdateSeasonAndFinalizeIfNeeded() {
 }
 
 // =============================
-// RIP DETECTION (simple + broad)
+// RIP DETECTION
 // =============================
 function messageHasRip(content) {
   const txt = content.toLowerCase();
@@ -437,149 +447,165 @@ function topYearNet(limit = 10) {
 }
 
 // =============================
-// MUSIC (QUICK WAY)
+// MUSIC (QUICK / UNSTABLE) — ENABLED BY FLAG
 // =============================
-// In-memory per-guild queue (will reset if bot restarts; that's fine for "quick way")
-const musicState = new Map(); // guildId -> { connection, player, queue: [{title,url}], playing: bool }
+let joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior;
+let getVoiceConnection, entersState, VoiceConnectionStatus, StreamType;
+let playdl;
+let musicState;
 
-function getGuildState(guildId) {
-  if (!musicState.has(guildId)) {
-    const player = createAudioPlayer({
-      behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
-    });
-
-    const state = { connection: null, player, queue: [], playing: false, textChannelId: null };
-    musicState.set(guildId, state);
-
-    // when a track ends, play next
-    player.on(AudioPlayerStatus.Idle, async () => {
-      state.playing = false;
-      await playNext(guildId);
-    });
-
-    player.on("error", async (err) => {
-      console.error("Audio player error:", err);
-      state.playing = false;
-      await playNext(guildId);
-    });
-  }
-  return musicState.get(guildId);
+function isMusicCommand(cmd) {
+  return ["play","skip","stop","pause","resume","queue","leave","voicecheck"].includes(cmd);
 }
 
-async function connectToUserVC(msg) {
-  const member = msg.member;
-  const voiceChannel = member?.voice?.channel;
-  if (!voiceChannel) {
-    await msg.reply("🎧 You need to join a voice channel first.");
-    return null;
+if (ENABLE_MUSIC) {
+  const ffmpegPath = require("ffmpeg-static");
+  process.env.FFMPEG_PATH = ffmpegPath;
+
+  ({
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    NoSubscriberBehavior,
+    getVoiceConnection,
+    entersState,
+    VoiceConnectionStatus,
+    StreamType
+  } = require("@discordjs/voice"));
+
+  playdl = require("play-dl");
+
+  // In-memory per-guild queue (resets on restart, OK)
+  musicState = new Map(); // guildId -> { connection, player, queue: [{title,url}], playing: bool, textChannelId }
+
+  function getGuildState(guildId) {
+    if (!musicState.has(guildId)) {
+      const player = createAudioPlayer({
+        behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
+      });
+
+      const state = { connection: null, player, queue: [], playing: false, textChannelId: null };
+      musicState.set(guildId, state);
+
+      player.on(AudioPlayerStatus.Idle, async () => {
+        state.playing = false;
+        await playNext(guildId);
+      });
+
+      player.on("error", async (err) => {
+        console.error("Audio player error:", err);
+        state.playing = false;
+        await playNext(guildId);
+      });
+    }
+    return musicState.get(guildId);
   }
 
-  const guildId = msg.guild.id;
-  const state = getGuildState(guildId);
+  async function connectToUserVC(msg) {
+    const member = msg.member;
+    const voiceChannel = member?.voice?.channel;
+    if (!voiceChannel) {
+      await msg.reply("🎧 You need to join a voice channel first.");
+      return null;
+    }
 
-  state.textChannelId = msg.channel.id;
+    const guildId = msg.guild.id;
+    const state = getGuildState(guildId);
+    state.textChannelId = msg.channel.id;
 
-  // re-use existing connection if in same channel
-  const existing = getVoiceConnection(guildId);
-  if (existing) {
-    state.connection = existing;
+    const existing = getVoiceConnection(guildId);
+    if (existing) {
+      state.connection = existing;
+      return state;
+    }
+
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId,
+      adapterCreator: msg.guild.voiceAdapterCreator,
+      selfDeaf: true
+    });
+
+    state.connection = connection;
+
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    } catch (e) {
+      console.error("Voice connect failed:", e);
+      try { connection.destroy(); } catch {}
+      state.connection = null;
+      await msg.reply("❌ Couldn’t join voice. Check bot permissions + try again.");
+      return null;
+    }
+
+    connection.subscribe(state.player);
     return state;
   }
 
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId: guildId,
-    adapterCreator: msg.guild.voiceAdapterCreator,
-    selfDeaf: true
-  });
-
-  state.connection = connection;
-
-  try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-  } catch (e) {
-    console.error("Voice connect failed:", e);
-    try { connection.destroy(); } catch {}
-    state.connection = null;
-    await msg.reply("❌ Couldn’t join voice. Check bot permissions + try again.");
-    return null;
+  function looksLikeUrl(s) {
+    return /^https?:\/\/\S+/i.test(s);
   }
 
-  connection.subscribe(state.player);
-  return state;
-}
+  async function resolveTrack(query) {
+    if (looksLikeUrl(query)) {
+      try {
+        const info = await playdl.video_basic_info(query).catch(() => null);
+        if (info?.video_details?.title) return { title: info.video_details.title, url: query };
+      } catch {}
+      return { title: query, url: query };
+    }
 
-function looksLikeUrl(s) {
-  return /^https?:\/\/\S+/i.test(s);
-}
+    const results = await playdl.search(query, { limit: 1 });
+    if (!results || results.length === 0) return null;
+    return { title: results[0].title || query, url: results[0].url };
+  }
 
-async function resolveTrack(query) {
-  // If URL: use it directly
-  if (looksLikeUrl(query)) {
-    // Try to get a nice title
+  async function playNext(guildId) {
+    const state = getGuildState(guildId);
+    if (state.playing) return;
+    if (!state.connection) return;
+    if (!state.queue.length) return;
+
+    const next = state.queue.shift();
+    state.playing = true;
+
     try {
-      const info = await playdl.video_basic_info(query).catch(() => null);
-      if (info?.video_details?.title) {
-        return { title: info.video_details.title, url: query };
+      const stream = await playdl.stream(next.url, { quality: 2 });
+      const resource = createAudioResource(stream.stream, {
+        inputType: stream.type === "opus" ? StreamType.OggOpus : StreamType.Arbitrary
+      });
+
+      state.player.play(resource);
+
+      if (state.textChannelId) {
+        const channel = client.channels.cache.get(state.textChannelId);
+        if (channel) channel.send(`🎶 Now playing: **${next.title}**`);
       }
-    } catch {}
-    return { title: query, url: query };
+    } catch (e) {
+      console.error("Play failed:", e);
+      state.playing = false;
+
+      if (state.textChannelId) {
+        const channel = client.channels.cache.get(state.textChannelId);
+        if (channel) channel.send("❌ That track failed (YouTube/SoundCloud sometimes blocks). Try another link/search.");
+      }
+
+      await playNext(guildId);
+    }
   }
 
-  // Otherwise: search YouTube (quick)
-  const results = await playdl.search(query, { limit: 1 });
-  if (!results || results.length === 0) return null;
-  return { title: results[0].title || query, url: results[0].url };
-}
-
-async function playNext(guildId) {
-  const state = getGuildState(guildId);
-  if (state.playing) return;
-  if (!state.connection) return;
-  if (!state.queue.length) return;
-
-  const next = state.queue.shift();
-  state.playing = true;
-
-  try {
-    const stream = await playdl.stream(next.url, { quality: 2 });
-    const resource = createAudioResource(stream.stream, {
-      inputType: stream.type === "opus" ? StreamType.OggOpus : StreamType.Arbitrary
-    });
-
-    state.player.play(resource);
-
-    // announce now playing
-    if (state.textChannelId) {
-      const channel = client.channels.cache.get(state.textChannelId);
-      if (channel) channel.send(`🎶 Now playing: **${next.title}**`);
-    }
-  } catch (e) {
-    console.error("Play failed:", e);
-    state.playing = false;
-
-    if (state.textChannelId) {
-      const channel = client.channels.cache.get(state.textChannelId);
-      if (channel) channel.send("❌ That track failed (YouTube/SoundCloud sometimes blocks). Try another link/search.");
-    }
-
-    // try next
-    await playNext(guildId);
-  }
+  // Expose inside handler scope:
+  global.__music = { getGuildState, connectToUserVC, resolveTrack, playNext };
 }
 
 // =============================
 // READY
 // =============================
 client.on("ready", async () => {
-  await redis.connect();
-  await loadData();
-
-  await maybeUpdateSeasonAndFinalizeIfNeeded();
-  await ensureRouletteTimer();
-
   console.log(`🔥 BongBot 2.0 online as ${client.user.tag}`);
 
+  // tick season updates every 10 min
   setInterval(async () => {
     try {
       await loadData();
@@ -594,253 +620,303 @@ client.on("ready", async () => {
 // MESSAGE HANDLER
 // =============================
 client.on("messageCreate", async (msg) => {
-  if (msg.author.bot) return;
+  try {
+    if (msg.author.bot) return;
 
-  await loadData();
+    await loadData();
 
-  const raw = msg.content.trim();
-  const content = raw.toLowerCase();
-  const userId = msg.author.id;
+    const raw = msg.content.trim();
+    const content = raw.toLowerCase();
+    const userId = msg.author.id;
 
-  ensureUser(userId);
+    // Basic debug command (helps instantly verify pipeline)
+    if (content === "!ping") return msg.reply("pong ✅");
 
-  // ---- Season info ----
-  if (content === "!season") {
-    const s = data.season;
-    return msg.reply(
-      `🗓️ **Season Info**\n` +
-        `Season ID: **${s.id || "unknown"}**\n` +
-        `Window: **${s.start || "?"}** → **${s.endExclusive || "?"}** (end is exclusive)\n` +
-        `Active right now: **${s.active ? "YES ✅" : "NO ❌"}**`
-    );
-  }
+    // Parse command token for music gating
+    let cmdToken = "";
+    if (content.startsWith("!")) cmdToken = content.slice(1).split(/\s+/)[0];
 
-  if (content === "!seasonboard") {
-    const rip = topSeasonRips(10);
-    const net = topSeasonNet(10);
+    if (!ENABLE_MUSIC && cmdToken && isMusicCommand(cmdToken)) {
+      return msg.reply("🎵 Music is temporarily disabled. (Set `ENABLE_MUSIC=true` to enable.)");
+    }
 
-    const ripLines = rip.length
-      ? rip.map((r, i) => `**${i + 1}.** <@${r.uid}> — **${r.val} rips**`).join("\n")
-      : "_No season rips yet._";
+    ensureUser(userId);
 
-    const netLines = net.length
-      ? net
-          .map((r, i) => {
-            const sign = r.val >= 0 ? "+" : "";
-            return `**${i + 1}.** <@${r.uid}> — **${sign}${r.val} net XP**`;
-          })
-          .join("\n")
-      : "_No season gambling yet._";
+    // ---- Season info ----
+    if (content === "!season") {
+      const s = data.season;
+      return msg.reply(
+        `🗓️ **Season Info**\n` +
+          `Season ID: **${s.id || "unknown"}**\n` +
+          `Window: **${s.start || "?"}** → **${s.endExclusive || "?"}** (end is exclusive)\n` +
+          `Active right now: **${s.active ? "YES ✅" : "NO ❌"}**`
+      );
+    }
 
-    return msg.reply(
-      `🏁 **Season Leaderboards** (Season: ${data.season.id})\n\n` +
-        `💨 **Top Season Rips**\n${ripLines}\n\n` +
-        `🎰 **Top Season Gambling Net XP**\n${netLines}`
-    );
-  }
+    if (content === "!seasonboard") {
+      const rip = topSeasonRips(10);
+      const net = topSeasonNet(10);
 
-  if (content === "!yearboard") {
-    const yr = data.yearly?.year || new Date().getFullYear();
-    const rip = topYearRips(10);
-    const net = topYearNet(10);
+      const ripLines = rip.length
+        ? rip.map((r, i) => `**${i + 1}.** <@${r.uid}> — **${r.val} rips**`).join("\n")
+        : "_No season rips yet._";
 
-    const ripLines = rip.length
-      ? rip.map((r, i) => `**${i + 1}.** <@${r.uid}> — **${r.val} rips**`).join("\n")
-      : "_No yearly totals yet._";
+      const netLines = net.length
+        ? net
+            .map((r, i) => {
+              const sign = r.val >= 0 ? "+" : "";
+              return `**${i + 1}.** <@${r.uid}> — **${sign}${r.val} net XP**`;
+            })
+            .join("\n")
+        : "_No season gambling yet._";
 
-    const netLines = net.length
-      ? net
-          .map((r, i) => {
-            const sign = r.val >= 0 ? "+" : "";
-            return `**${i + 1}.** <@${r.uid}> — **${sign}${r.val} net XP**`;
-          })
-          .join("\n")
-      : "_No yearly gambling totals yet._";
+      return msg.reply(
+        `🏁 **Season Leaderboards** (Season: ${data.season.id})\n\n` +
+          `💨 **Top Season Rips**\n${ripLines}\n\n` +
+          `🎰 **Top Season Gambling Net XP**\n${netLines}`
+      );
+    }
 
-    return msg.reply(
-      `📅 **Yearly Leaderboards (${yr})**\n\n` +
-        `💨 **Year Rips (sum of seasons)**\n${ripLines}\n\n` +
-        `🎰 **Year Gambling Net XP (sum of seasons)**\n${netLines}`
-    );
-  }
+    if (content === "!yearboard") {
+      const yr = data.yearly?.year || new Date().getFullYear();
+      const rip = topYearRips(10);
+      const net = topYearNet(10);
 
-  // ---- Personal stats ----
-  if (content === "!ripstats") {
-    const u = data.userStats[userId];
-    const s = data.seasonStats[userId] || { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
-    const net = (s.seasonGambleWon || 0) - (s.seasonGambleBet || 0);
+      const ripLines = rip.length
+        ? rip.map((r, i) => `**${i + 1}.** <@${r.uid}> — **${r.val} rips**`).join("\n")
+        : "_No yearly totals yet._";
 
-    return msg.reply(
-      `👤 **Your Stats**\n` +
-        `XP: **${u.xp}**\n` +
-        `All-time rips: **${u.totalRipsAllTime}**\n\n` +
-        `🏁 **This Season (${data.season.id})**\n` +
-        `Season rips: **${s.seasonRips || 0}**\n` +
-        `Season gambling net: **${net} XP**`
-    );
-  }
+      const netLines = net.length
+        ? net
+            .map((r, i) => {
+              const sign = r.val >= 0 ? "+" : "";
+              return `**${i + 1}.** <@${r.uid}> — **${sign}${r.val} net XP**`;
+            })
+            .join("\n")
+        : "_No yearly gambling totals yet._";
 
-  // ---- Admin restore ----
-  if (content.startsWith("!addexp")) {
-    if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
-    const target = msg.mentions.users.first();
-    const parts = raw.split(/\s+/);
-    const amt = parseInt(parts[2], 10);
-    if (!target || isNaN(amt)) return msg.reply("Usage: `!addexp @user <amount>`");
+      return msg.reply(
+        `📅 **Yearly Leaderboards (${yr})**\n\n` +
+          `💨 **Year Rips (sum of seasons)**\n${ripLines}\n\n` +
+          `🎰 **Year Gambling Net XP (sum of seasons)**\n${netLines}`
+      );
+    }
 
-    ensureUser(target.id);
-    data.userStats[target.id].xp = Math.max(0, data.userStats[target.id].xp + amt);
-    await saveData();
-    return msg.reply(`✅ Added **${amt} XP** to <@${target.id}>. Now **${data.userStats[target.id].xp} XP**.`);
-  }
+    // ---- Personal stats ----
+    if (content === "!ripstats") {
+      const u = data.userStats[userId];
+      const s = data.seasonStats[userId] || { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
+      const net = (s.seasonGambleWon || 0) - (s.seasonGambleBet || 0);
 
-  if (content.startsWith("!addrips")) {
-    if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
-    const target = msg.mentions.users.first();
-    const parts = raw.split(/\s+/);
-    const amt = parseInt(parts[2], 10);
-    if (!target || isNaN(amt) || amt <= 0) return msg.reply("Usage: `!addrips @user <amount>`");
+      return msg.reply(
+        `👤 **Your Stats**\n` +
+          `XP: **${u.xp}**\n` +
+          `All-time rips: **${u.totalRipsAllTime}**\n\n` +
+          `🏁 **This Season (${data.season.id})**\n` +
+          `Season rips: **${s.seasonRips || 0}**\n` +
+          `Season gambling net: **${net} XP**`
+      );
+    }
 
-    ensureUser(target.id);
-    data.userStats[target.id].totalRipsAllTime += amt;
-    await saveData();
-    return msg.reply(`✅ Added **${amt} total rips** to <@${target.id}>.`);
-  }
+    // ---- Admin restore ----
+    if (content.startsWith("!addexp")) {
+      if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
+      const target = msg.mentions.users.first();
+      const parts = raw.split(/\s+/);
+      const amt = parseInt(parts[2], 10);
+      if (!target || isNaN(amt)) return msg.reply("Usage: `!addexp @user <amount>`");
 
-  // =============================
-  // ROULETTE
-  // =============================
-  if (content.startsWith("!red ")) {
-    const parts = raw.split(/\s+/);
-    const amt = parseInt(parts[1], 10);
-    if (isNaN(amt)) return msg.reply("Usage: `!red <bet>`");
+      ensureUser(target.id);
+      data.userStats[target.id].xp = Math.max(0, data.userStats[target.id].xp + amt);
+      await saveData();
+      return msg.reply(`✅ Added **${amt} XP** to <@${target.id}>. Now **${data.userStats[target.id].xp} XP**.`);
+    }
 
-    const res = await placeBet({ userId, channelId: msg.channel.id, type: "red", pick: "red", amount: amt });
-    await saveData();
-    return msg.reply(res.msg);
-  }
+    if (content.startsWith("!addrips")) {
+      if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
+      const target = msg.mentions.users.first();
+      const parts = raw.split(/\s+/);
+      const amt = parseInt(parts[2], 10);
+      if (!target || isNaN(amt) || amt <= 0) return msg.reply("Usage: `!addrips @user <amount>`");
 
-  if (content.startsWith("!black ")) {
-    const parts = raw.split(/\s+/);
-    const amt = parseInt(parts[1], 10);
-    if (isNaN(amt)) return msg.reply("Usage: `!black <bet>`");
+      ensureUser(target.id);
+      data.userStats[target.id].totalRipsAllTime += amt;
+      await saveData();
+      return msg.reply(`✅ Added **${amt} total rips** to <@${target.id}>.`);
+    }
 
-    const res = await placeBet({ userId, channelId: msg.channel.id, type: "black", pick: "black", amount: amt });
-    await saveData();
-    return msg.reply(res.msg);
-  }
+    // =============================
+    // ROULETTE
+    // =============================
+    if (content.startsWith("!red ")) {
+      const parts = raw.split(/\s+/);
+      const amt = parseInt(parts[1], 10);
+      if (isNaN(amt)) return msg.reply("Usage: `!red <bet>`");
 
-  if (content.startsWith("!number ")) {
-    const parts = raw.split(/\s+/);
-    const pick = (parts[1] || "").toString();
-    const amt = parseInt(parts[2], 10);
+      const res = await placeBet({ userId, channelId: msg.channel.id, type: "red", pick: "red", amount: amt });
+      return msg.reply(res.msg);
+    }
 
-    const validPick = pick === "00" || (/^\d+$/.test(pick) && Number(pick) >= 0 && Number(pick) <= 36);
-    if (!validPick || isNaN(amt)) return msg.reply("Usage: `!number <0-36|00> <bet>`");
+    if (content.startsWith("!black ")) {
+      const parts = raw.split(/\s+/);
+      const amt = parseInt(parts[1], 10);
+      if (isNaN(amt)) return msg.reply("Usage: `!black <bet>`");
 
-    const res = await placeBet({ userId, channelId: msg.channel.id, type: "number", pick, amount: amt });
-    await saveData();
-    return msg.reply(res.msg);
-  }
+      const res = await placeBet({ userId, channelId: msg.channel.id, type: "black", pick: "black", amount: amt });
+      return msg.reply(res.msg);
+    }
 
-  if (content === "!roulette") {
-    const round = await getRouletteRound();
-    if (!round) return msg.reply("🎰 No active roulette round. Place a bet with `!red`, `!black`, or `!number`.");
-    const secondsLeft = Math.max(0, Math.ceil((round.endTime - Date.now()) / 1000));
-    return msg.reply(`🎰 Roulette is open — **${secondsLeft}s** left. Bets so far: **${round.bets.length}**`);
-  }
+    if (content.startsWith("!number ")) {
+      const parts = raw.split(/\s+/);
+      const pick = (parts[1] || "").toString();
+      const amt = parseInt(parts[2], 10);
 
-  // =============================
-  // MUSIC COMMANDS (Quick way)
-  // =============================
-  if (content.startsWith("!play ")) {
-    const query = raw.slice("!play ".length).trim();
-    if (!query) return msg.reply("Usage: `!play <youtube url | soundcloud url | search terms>`");
+      const validPick = pick === "00" || (/^\d+$/.test(pick) && Number(pick) >= 0 && Number(pick) <= 36);
+      if (!validPick || isNaN(amt)) return msg.reply("Usage: `!number <0-36|00> <bet>`");
 
-    const state = await connectToUserVC(msg);
-    if (!state) return;
+      const res = await placeBet({ userId, channelId: msg.channel.id, type: "number", pick, amount: amt });
+      return msg.reply(res.msg);
+    }
 
-    const track = await resolveTrack(query);
-    if (!track) return msg.reply("❌ Couldn’t find anything for that search.");
+    if (content === "!roulette") {
+      const round = await getRouletteRound();
+      if (!round) return msg.reply("🎰 No active roulette round. Place a bet with `!red`, `!black`, or `!number`.");
+      const secondsLeft = Math.max(0, Math.ceil((round.endTime - Date.now()) / 1000));
+      return msg.reply(`🎰 Roulette is open — **${secondsLeft}s** left. Bets so far: **${round.bets.length}**`);
+    }
 
-    state.queue.push(track);
+    // =============================
+    // MUSIC COMMANDS (only if enabled)
+    // =============================
+    if (ENABLE_MUSIC && content.startsWith("!voicecheck")) {
+      const vc = msg.member?.voice?.channel;
+      const me = msg.guild?.members?.me;
 
-    await msg.reply(`✅ Queued: **${track.title}**`);
+      const lines = [];
+      lines.push(`ENABLE_MUSIC: **true**`);
+      lines.push(`FFMPEG_PATH set: **${process.env.FFMPEG_PATH ? "YES" : "NO"}**`);
+      lines.push(`You in VC: **${vc ? vc.name : "NO"}**`);
 
-    // start if idle
-    if (!state.playing) await playNext(msg.guild.id);
-    return;
-  }
+      if (vc && me) {
+        const perms = vc.permissionsFor(me);
+        lines.push(`Bot can CONNECT: **${perms?.has(PermissionsBitField.Flags.Connect) ? "YES" : "NO"}**`);
+        lines.push(`Bot can SPEAK: **${perms?.has(PermissionsBitField.Flags.Speak) ? "YES" : "NO"}**`);
+      }
 
-  if (content === "!skip") {
-    const state = getGuildState(msg.guild.id);
-    if (!state.connection) return msg.reply("❌ I’m not in a voice channel.");
-    state.player.stop(true);
-    return msg.reply("⏭️ Skipped.");
-  }
+      return msg.reply("🔎 **VoiceCheck**\n" + lines.join("\n"));
+    }
 
-  if (content === "!stop") {
-    const state = getGuildState(msg.guild.id);
-    state.queue = [];
-    if (state.player) state.player.stop(true);
-    return msg.reply("🛑 Stopped and cleared the queue.");
-  }
+    if (ENABLE_MUSIC && content.startsWith("!play ")) {
+      const query = raw.slice("!play ".length).trim();
+      if (!query) return msg.reply("Usage: `!play <youtube url | soundcloud url | search terms>`");
 
-  if (content === "!pause") {
-    const state = getGuildState(msg.guild.id);
-    if (!state.player) return msg.reply("❌ Nothing playing.");
-    state.player.pause();
-    return msg.reply("⏸️ Paused.");
-  }
+      const { connectToUserVC, resolveTrack, playNext } = global.__music;
 
-  if (content === "!resume") {
-    const state = getGuildState(msg.guild.id);
-    if (!state.player) return msg.reply("❌ Nothing playing.");
-    state.player.unpause();
-    return msg.reply("▶️ Resumed.");
-  }
+      const state = await connectToUserVC(msg);
+      if (!state) return;
 
-  if (content === "!queue") {
-    const state = getGuildState(msg.guild.id);
-    if (!state.queue.length) return msg.reply("📭 Queue is empty.");
-    const lines = state.queue.slice(0, 10).map((t, i) => `**${i + 1}.** ${t.title}`);
-    return msg.reply(`📜 **Queue**\n${lines.join("\n")}`);
-  }
+      const track = await resolveTrack(query);
+      if (!track) return msg.reply("❌ Couldn’t find anything for that search.");
 
-  if (content === "!leave") {
-    const conn = getVoiceConnection(msg.guild.id);
-    if (conn) conn.destroy();
-    const state = getGuildState(msg.guild.id);
-    state.queue = [];
-    state.playing = false;
-    state.connection = null;
-    return msg.reply("👋 Left voice and cleared the queue.");
-  }
+      state.queue.push(track);
+      await msg.reply(`✅ Queued: **${track.title}**`);
 
-  // =============================
-  // RIP COUNTING (ONLY DURING SEASON)
-  // =============================
-  if (messageHasRip(content)) {
-    data.userStats[userId].totalRipsAllTime += 1;
+      if (!state.playing) await playNext(msg.guild.id);
+      return;
+    }
 
-    if (data.season.active) {
-      if (!data.seasonStats[userId]) data.seasonStats[userId] = { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
-      data.seasonStats[userId].seasonRips += 1;
+    if (ENABLE_MUSIC && content === "!skip") {
+      const { getGuildState } = global.__music;
+      const state = getGuildState(msg.guild.id);
+      if (!state.connection) return msg.reply("❌ I’m not in a voice channel.");
+      state.player.stop(true);
+      return msg.reply("⏭️ Skipped.");
+    }
 
-      // No constant spam replies (keeps interest)
+    if (ENABLE_MUSIC && content === "!stop") {
+      const { getGuildState } = global.__music;
+      const state = getGuildState(msg.guild.id);
+      state.queue = [];
+      if (state.player) state.player.stop(true);
+      return msg.reply("🛑 Stopped and cleared the queue.");
+    }
+
+    if (ENABLE_MUSIC && content === "!pause") {
+      const { getGuildState } = global.__music;
+      const state = getGuildState(msg.guild.id);
+      if (!state.player) return msg.reply("❌ Nothing playing.");
+      state.player.pause();
+      return msg.reply("⏸️ Paused.");
+    }
+
+    if (ENABLE_MUSIC && content === "!resume") {
+      const { getGuildState } = global.__music;
+      const state = getGuildState(msg.guild.id);
+      if (!state.player) return msg.reply("❌ Nothing playing.");
+      state.player.unpause();
+      return msg.reply("▶️ Resumed.");
+    }
+
+    if (ENABLE_MUSIC && content === "!queue") {
+      const { getGuildState } = global.__music;
+      const state = getGuildState(msg.guild.id);
+      if (!state.queue.length) return msg.reply("📭 Queue is empty.");
+      const lines = state.queue.slice(0, 10).map((t, i) => `**${i + 1}.** ${t.title}`);
+      return msg.reply(`📜 **Queue**\n${lines.join("\n")}`);
+    }
+
+    if (ENABLE_MUSIC && content === "!leave") {
+      const conn = getVoiceConnection(msg.guild.id);
+      if (conn) conn.destroy();
+
+      const { getGuildState } = global.__music;
+      const state = getGuildState(msg.guild.id);
+      state.queue = [];
+      state.playing = false;
+      state.connection = null;
+
+      return msg.reply("👋 Left voice and cleared the queue.");
+    }
+
+    // =============================
+    // RIP COUNTING (ONLY DURING SEASON)
+    // =============================
+    if (messageHasRip(content)) {
+      data.userStats[userId].totalRipsAllTime += 1;
+
+      if (data.season.active) {
+        if (!data.seasonStats[userId]) data.seasonStats[userId] = { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
+        data.seasonStats[userId].seasonRips += 1;
+
+        await saveData();
+        return;
+      }
+
       await saveData();
       return;
     }
 
-    await saveData();
-    return;
+    // no-op message; don't spam Redis writes
+    // (we still loaded data above, but we won't save unless something changed)
+  } catch (e) {
+    console.error("messageCreate handler error:", e);
+    try { await msg.reply("❌ Internal error (check Railway logs)."); } catch {}
   }
-
-  await saveData();
 });
 
 // =============================
-// LOGIN
+// STARTUP
 // =============================
-client.login(process.env.BOT_TOKEN);
+(async () => {
+  try {
+    await redis.connect();
+    await loadData();
+    await maybeUpdateSeasonAndFinalizeIfNeeded();
+    await ensureRouletteTimer();
 
+    await client.login(process.env.BOT_TOKEN);
+  } catch (err) {
+    console.error("Startup failed:", err);
+    process.exit(1);
+  }
+})();
