@@ -1,6 +1,10 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const { createClient } = require("redis");
 
+const ffmpegPath = require("ffmpeg-static");
+process.env.FFMPEG_PATH = ffmpegPath;
+
+
 // Voice / Music (quick way; can break sometimes)
 const {
   joinVoiceChannel,
@@ -839,3 +843,4 @@ client.on("messageCreate", async (msg) => {
 // LOGIN
 // =============================
 client.login(process.env.BOT_TOKEN);
+
