@@ -1,5 +1,5 @@
 // =============================
-// BongBot 2.0 - index.js (FINAL)
+// BongBot 2.0 - index.js (FIXED)
 // =============================
 
 process.on("unhandledRejection", console.error);
@@ -22,7 +22,7 @@ if (!process.env.REDIS_URL) throw new Error("REDIS_URL missing");
 // =============================
 // CONFIG
 // =============================
-const BOT_VERSION = "2.0.0";
+const BOT_VERSION = "2.0.1";
 const ALERT_CHANNEL_ID = "757698153494609943";
 
 // Roulette
@@ -60,7 +60,6 @@ const redis = createClient({
 
 const DATA_KEY = "bongbot2:data";
 const META_KEY = "bongbot2:meta";
-const ROULETTE_KEY = "bongbot2:roulette";
 
 redis.on("error", console.error);
 
@@ -85,7 +84,8 @@ let data = {
   season: { id: null, start: null, endExclusive: null, active: false },
   seasonStats: {},
   yearly: { year: null, totals: {} },
-  autoReplyEnabled: AUTO_REPLY_DEFAULT
+  autoReplyEnabled: AUTO_REPLY_DEFAULT,
+  topDaily: [] // [{ date, uid, count }]
 };
 
 // =============================
@@ -101,15 +101,16 @@ function chicagoDateStr(d = new Date()) {
 }
 
 function chicagoWeekKey(d = new Date()) {
+  // Week starts Sunday
   const cd = new Date(d.toLocaleString("en-US", { timeZone: "America/Chicago" }));
   const day = cd.getDay(); // 0 Sun
   cd.setDate(cd.getDate() - day);
-  return chicagoDateStr(cd);
+  return chicagoDateStr(cd); // key = Sunday date
 }
 
 function monthKey(d = new Date()) {
   const s = chicagoDateStr(d);
-  return s.slice(0, 7);
+  return s.slice(0, 7); // YYYY-MM
 }
 
 // =============================
@@ -127,7 +128,8 @@ async function checkVersionReset() {
       season: { id: null, start: null, endExclusive: null, active: false },
       seasonStats: {},
       yearly: { year: null, totals: {} },
-      autoReplyEnabled: AUTO_REPLY_DEFAULT
+      autoReplyEnabled: AUTO_REPLY_DEFAULT,
+      topDaily: []
     };
     await redis.set(DATA_KEY, JSON.stringify(data));
     await redis.set(META_KEY, JSON.stringify({ version: DATA_VERSION }));
@@ -140,6 +142,16 @@ async function checkVersionReset() {
 async function loadData() {
   const raw = await redis.get(DATA_KEY);
   if (raw) data = JSON.parse(raw);
+
+  // normalize for safety
+  if (!data.users) data.users = {};
+  if (!data.activity) data.activity = {};
+  if (!data.season) data.season = { id: null, start: null, endExclusive: null, active: false };
+  if (!data.seasonStats) data.seasonStats = {};
+  if (!data.yearly) data.yearly = { year: null, totals: {} };
+  if (!data.yearly.totals) data.yearly.totals = {};
+  if (typeof data.autoReplyEnabled !== "boolean") data.autoReplyEnabled = AUTO_REPLY_DEFAULT;
+  if (!Array.isArray(data.topDaily)) data.topDaily = [];
 }
 
 async function saveData() {
@@ -170,6 +182,14 @@ function ensureUser(uid) {
   const y = new Date().getFullYear();
   if (!data.yearly.year) data.yearly.year = y;
   if (!data.yearly.totals[uid]) data.yearly.totals[uid] = { yearRips: 0, yearGambleNet: 0 };
+
+  if (!data.seasonStats[uid]) {
+    data.seasonStats[uid] = { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
+  }
+}
+
+function isAdmin(member) {
+  return !!member?.permissions?.has(PermissionsBitField.Flags.Administrator);
 }
 
 // =============================
@@ -204,25 +224,45 @@ function rollCrit(state, add) {
   const rollChance = Math.min(1, Math.max(0, chanceBefore));
   const hit = Math.random() < rollChance;
 
-  if (hit) {
-    state.critChance = BASE_CRIT_START;
-  } else {
-    state.critChance += add;
-  }
+  if (hit) state.critChance = BASE_CRIT_START;
+  else state.critChance += add;
 
   return { hit, used: chanceBefore };
 }
 
 // =============================
-// COMMAND REGISTRY
+// TOP DAILY (GLOBAL TOP 3)
+// =============================
+function updateTopDaily(dateStr, uid, count) {
+  data.topDaily = data.topDaily.filter(x => !(x.date === dateStr && x.uid === uid));
+  data.topDaily.push({ date: dateStr, uid, count });
+  data.topDaily.sort((a, b) => b.count - a.count);
+  data.topDaily = data.topDaily.slice(0, 3);
+}
+
+// =============================
+// COMMAND LIST
 // =============================
 const COMMANDS = [
-  "!commands","!help <cmd>","!ping","!version","!uptime",
-  "!ripstats","!crit","!season","!seasonboard","!yearboard",
-  "!mostrips","!toprippers",
-  "!red <bet>","!black <bet>","!number <n|00> <bet>","!roulette",
-  "!addexp @user <amt>","!addrips @user <amt>","!toggleautoreply"
+  { name: "!commands", desc: "Show all commands" },
+  { name: "!help <cmd>", desc: "Help for a command" },
+  { name: "!ping", desc: "Health check" },
+  { name: "!version", desc: "Bot version" },
+  { name: "!uptime", desc: "How long bot has been running" },
+
+  { name: "!ripstats", desc: "Your stats (XP, rips, counts, crit, streak)" },
+  { name: "!crit", desc: "Show current crit chance + add rates" },
+  { name: "!mostrips", desc: "Top 3 single-day records (global)" },
+  { name: "!toprippers", desc: "Top rippers leaderboard (all-time)" },
+
+  { name: "!toggleautoreply", desc: "Admin: toggle auto replies" },
+  { name: "!addexp @user <amt>", desc: "Admin: add XP" },
+  { name: "!addrips @user <amt>", desc: "Admin: add all-time rips" },
 ];
+
+function formatCommands() {
+  return `📜 **BongBot Commands**\n` + COMMANDS.map(c => `• \`${c.name}\` — ${c.desc}`).join("\n");
+}
 
 // =============================
 // MESSAGE HANDLER
@@ -231,98 +271,203 @@ const lastReplyAt = new Map();
 const START_TIME = Date.now();
 
 client.on("messageCreate", async (msg) => {
-  if (msg.author.bot) return;
-  await loadData();
+  try {
+    if (msg.author.bot) return;
 
-  const raw = msg.content.trim();
-  const content = raw.toLowerCase();
-  const uid = msg.author.id;
+    await loadData();
 
-  ensureUser(uid);
+    const raw = msg.content.trim();
+    const content = raw.toLowerCase();
+    const uid = msg.author.id;
 
-  // -------- BASIC COMMANDS --------
-  if (content === "!ping") return msg.reply("pong ✅");
-  if (content === "!version") return msg.reply(`BongBot v${BOT_VERSION}`);
-  if (content === "!uptime") {
-    const mins = Math.floor((Date.now() - START_TIME) / 60000);
-    return msg.reply(`⏱️ Uptime: ${mins} min`);
-  }
+    ensureUser(uid);
 
-  if (content === "!commands")
-    return msg.reply(`📜 **Commands**\n${COMMANDS.map(c => `• ${c}`).join("\n")}`);
+    // ---------- COMMANDS FIRST ----------
+    if (content.startsWith("!")) {
+      const parts = raw.split(/\s+/);
+      const cmd = parts[0].toLowerCase();
+      const args = parts.slice(1);
 
-  if (content.startsWith("!help"))
-    return msg.reply("ℹ️ Use `!commands` to see everything.");
+      if (cmd === "!ping") return msg.reply("pong ✅");
+      if (cmd === "!version") return msg.reply(`BongBot v${BOT_VERSION}`);
+      if (cmd === "!uptime") {
+        const ms = Date.now() - START_TIME;
+        const mins = Math.floor(ms / 60000);
+        const hrs = Math.floor(mins / 60);
+        const rem = mins % 60;
+        return msg.reply(`⏱️ Uptime: **${hrs}h ${rem}m**`);
+      }
 
-  if (content === "!toggleautoreply") {
-    if (!msg.member.permissions.has(PermissionsBitField.Flags.Administrator))
-      return msg.reply("Admins only.");
-    data.autoReplyEnabled = !data.autoReplyEnabled;
-    await saveData();
-    return msg.reply(`Auto replies: **${data.autoReplyEnabled ? "ON" : "OFF"}**`);
-  }
+      if (cmd === "!commands") return msg.reply(formatCommands());
+      if (cmd === "!help") return msg.reply("Use `!commands` for the full list.");
 
-  if (content === "!crit") {
+      if (cmd === "!toggleautoreply") {
+        if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
+        data.autoReplyEnabled = !data.autoReplyEnabled;
+        await saveData();
+        return msg.reply(`Auto replies: **${data.autoReplyEnabled ? "ON" : "OFF"}**`);
+      }
+
+      if (cmd === "!crit") {
+        const a = data.activity[uid];
+        return msg.reply(
+          `🎯 Crit chance: **${(a.critChance * 100).toFixed(2)}%**\n` +
+          `Adds on miss:\n` +
+          `• Bong: +4.20%\n` +
+          `• Pen: +2.10%\n` +
+          `• Dab: +7.10%\n` +
+          `• Eddys: +8.40%\n` +
+          `• Joint: +4.20%`
+        );
+      }
+
+      if (cmd === "!ripstats") {
+        const u = data.users[uid];
+        const a = data.activity[uid];
+        return msg.reply(
+          `👤 **Your Stats**\n` +
+          `XP: **${u.xp}**\n` +
+          `All-time rips: **${u.allTimeRips}**\n\n` +
+          `📊 **Counts (Chicago time)**\n` +
+          `Today: **${a.daily}**\n` +
+          `This week: **${a.weekly}**\n` +
+          `This month: **${a.monthly}**\n` +
+          `This year: **${a.yearly}**\n\n` +
+          `🔥 Streak: **${a.streak}**\n` +
+          `🎯 Crit chance: **${(a.critChance * 100).toFixed(2)}%**`
+        );
+      }
+
+      if (cmd === "!mostrips") {
+        if (!data.topDaily.length) return msg.reply("No daily records yet.");
+        const lines = data.topDaily.map((r, i) => `**${i + 1}.** <@${r.uid}> — **${r.count}** on **${r.date}**`);
+        return msg.reply(`🏆 **Most Rips In A Day (Top 3)**\n${lines.join("\n")}`);
+      }
+
+      if (cmd === "!toprippers") {
+        const entries = Object.entries(data.users)
+          .map(([id, u]) => ({ id, rips: u.allTimeRips || 0 }))
+          .sort((a, b) => b.rips - a.rips)
+          .slice(0, 10);
+
+        if (!entries.length) return msg.reply("No rip data yet.");
+        const lines = entries.map((e, i) => `**${i + 1}.** <@${e.id}> — **${e.rips} rips**`);
+        return msg.reply(`🏁 **Top Rippers (All-time)**\n${lines.join("\n")}`);
+      }
+
+      if (cmd === "!addexp") {
+        if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
+        const target = msg.mentions.users.first();
+        const amt = parseInt(args[1], 10);
+        if (!target || Number.isNaN(amt)) return msg.reply("Usage: `!addexp @user <amount>`");
+
+        ensureUser(target.id);
+        data.users[target.id].xp = Math.max(0, data.users[target.id].xp + amt);
+        await saveData();
+        return msg.reply(`✅ Added **${amt} XP** to <@${target.id}>. Now **${data.users[target.id].xp} XP**.`);
+      }
+
+      if (cmd === "!addrips") {
+        if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
+        const target = msg.mentions.users.first();
+        const amt = parseInt(args[1], 10);
+        if (!target || Number.isNaN(amt) || amt <= 0) return msg.reply("Usage: `!addrips @user <amount>`");
+
+        ensureUser(target.id);
+        data.users[target.id].allTimeRips += amt;
+        await saveData();
+        return msg.reply(`✅ Added **${amt} all-time rips** to <@${target.id}>.`);
+      }
+
+      // If it's a command we don't handle, stop here so it doesn't count as a rip.
+      return;
+    }
+
+    // ---------- RIP HANDLING (NON-COMMAND MESSAGES ONLY) ----------
+    const cat = detectCategory(content);
+    if (!cat) return;
+
     const a = data.activity[uid];
+    const u = data.users[uid];
+
+    const today = chicagoDateStr();
+    const wk = chicagoWeekKey();
+    const mo = monthKey();
+    const yr = new Date().getFullYear();
+
+    // reset counters by periods
+    if (a.day !== today) { a.day = today; a.daily = 0; a.streak += 1; }
+    if (a.week !== wk) { a.week = wk; a.weekly = 0; }
+    if (a.month !== mo) { a.month = mo; a.monthly = 0; }
+    if (a.year !== yr) { a.year = yr; a.yearly = 0; }
+
+    a.daily++; a.weekly++; a.monthly++; a.yearly++;
+    u.allTimeRips++;
+
+    updateTopDaily(today, uid, a.daily);
+
+    const crit = rollCrit(a, cat.add);
+    let xp = cat.xp;
+    if (crit.hit) xp = (cat.name === "DAB") ? CRIT_PAYOUT_DAB : CRIT_PAYOUT_GENERAL;
+    u.xp += xp;
+
+    await saveData();
+
+    // Auto reply (cooldown)
+    if (!data.autoReplyEnabled) return;
+
+    const last = lastReplyAt.get(uid) || 0;
+    if (Date.now() - last < AUTO_REPLY_COOLDOWN_MS) return;
+    lastReplyAt.set(uid, Date.now());
+
     return msg.reply(
-      `🎯 Crit chance: **${(a.critChance * 100).toFixed(2)}%**\n` +
-      `Adds → Bong +4.20 | Pen +2.10 | Dab +7.10 | Eddys +8.40 | Joint +4.20`
+      `💨 **${cat.name} REGISTERED**\n` +
+      `🎯 Crit used: **${(crit.used * 100).toFixed(2)}%**\n` +
+      (crit.hit ? `💥 **CRIT HIT!**\n` : "") +
+      `💰 +${xp} XP | Total: **${u.xp}**\n` +
+      `🔥 Streak: **${a.streak}** | Today: **${a.daily}**`
     );
+
+  } catch (e) {
+    console.error("messageCreate error:", e);
+    try { await msg.reply("❌ Internal error (check Railway logs)."); } catch {}
   }
-
-  // -------- RIP HANDLING --------
-  const cat = detectCategory(content);
-  if (!cat) return;
-
-  const a = data.activity[uid];
-  const u = data.users[uid];
-
-  const today = chicagoDateStr();
-  const wk = chicagoWeekKey();
-  const mo = monthKey();
-  const yr = new Date().getFullYear();
-
-  if (a.day !== today) {
-    a.day = today;
-    a.daily = 0;
-    a.streak += 1;
-  }
-  if (a.week !== wk) { a.week = wk; a.weekly = 0; }
-  if (a.month !== mo) { a.month = mo; a.monthly = 0; }
-  if (a.year !== yr) { a.year = yr; a.yearly = 0; }
-
-  a.daily++; a.weekly++; a.monthly++; a.yearly++;
-  u.allTimeRips++;
-
-  const crit = rollCrit(a, cat.add);
-  let xp = cat.xp;
-  if (crit.hit) xp = cat.name === "DAB" ? CRIT_PAYOUT_DAB : CRIT_PAYOUT_GENERAL;
-
-  u.xp += xp;
-
-  await saveData();
-
-  // Auto reply (cooldown)
-  if (!data.autoReplyEnabled) return;
-  const last = lastReplyAt.get(uid) || 0;
-  if (Date.now() - last < AUTO_REPLY_COOLDOWN_MS) return;
-  lastReplyAt.set(uid, Date.now());
-
-  return msg.reply(
-    `💨 **${cat.name} REGISTERED**\n` +
-    `🎯 Crit used: ${(crit.used * 100).toFixed(2)}%\n` +
-    (crit.hit ? "💥 **CRIT HIT!**\n" : "") +
-    `💰 +${xp} XP | Total XP: ${u.xp}\n` +
-    `🔥 Streak: ${a.streak} | Today: ${a.daily}`
-  );
 });
 
 // =============================
 // STARTUP
 // =============================
 (async () => {
-  await redis.connect();
-  await checkVersionReset();
-  await loadData();
-  await client.login(process.env.BOT_TOKEN);
+  try {
+    await redis.connect();
+    await checkVersionReset();
+    await loadData();
+    await client.login(process.env.BOT_TOKEN);
+    console.log(`🔥 BongBot online as ${client.user.tag}`);
+  } catch (err) {
+    console.error("Startup failed:", err);
+    process.exit(1);
+  }
 })();
+
+// =============================
+// VERSIONED RESET ON STARTUP
+// =============================
+async function checkVersionReset() {
+  const raw = await redis.get(META_KEY);
+  const meta = raw ? JSON.parse(raw) : {};
+  if (meta.version !== DATA_VERSION) {
+    console.log("🔥 DATA_VERSION changed — wiping XP/activity");
+    data = {
+      users: {},
+      activity: {},
+      season: { id: null, start: null, endExclusive: null, active: false },
+      seasonStats: {},
+      yearly: { year: null, totals: {} },
+      autoReplyEnabled: AUTO_REPLY_DEFAULT,
+      topDaily: []
+    };
+    await redis.set(DATA_KEY, JSON.stringify(data));
+    await redis.set(META_KEY, JSON.stringify({ version: DATA_VERSION }));
+  }
+}
