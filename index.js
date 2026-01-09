@@ -1,10 +1,9 @@
 // =============================
-// BongBot 2.0 - index.js
-// Node.js + discord.js v14 + Redis
+// BongBot 2.0 - index.js (FINAL)
 // =============================
 
-process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
-process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+process.on("unhandledRejection", console.error);
+process.on("uncaughtException", console.error);
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const { createClient } = require("redis");
@@ -13,23 +12,41 @@ const { createClient } = require("redis");
 // ENV / FLAGS
 // =============================
 const ENABLE_MUSIC = (process.env.ENABLE_MUSIC || "false").toLowerCase() === "true";
+const AUTO_REPLY_DEFAULT = (process.env.AUTO_REPLY_DEFAULT || "true").toLowerCase() === "true";
+const AUTO_REPLY_COOLDOWN_MS = Number(process.env.AUTO_REPLY_COOLDOWN_MS || 2500);
+const DATA_VERSION = String(process.env.DATA_VERSION || "0");
 
-console.log("Booting BongBot 2.0...");
-console.log("ENABLE_MUSIC:", ENABLE_MUSIC);
-console.log("Has BOT_TOKEN:", !!process.env.BOT_TOKEN);
-console.log("Has REDIS_URL:", !!process.env.REDIS_URL);
-
-if (!process.env.BOT_TOKEN) throw new Error("BOT_TOKEN missing in Railway variables.");
-if (!process.env.REDIS_URL) throw new Error("REDIS_URL missing in Railway variables (BongBot service).");
+if (!process.env.BOT_TOKEN) throw new Error("BOT_TOKEN missing");
+if (!process.env.REDIS_URL) throw new Error("REDIS_URL missing");
 
 // =============================
 // CONFIG
 // =============================
+const BOT_VERSION = "2.0.0";
 const ALERT_CHANNEL_ID = "757698153494609943";
 
 // Roulette
 const ROULETTE_WINDOW_MS = 90 * 1000;
 const MIN_BET = 420;
+
+// =============================
+// XP + CRIT CONFIG
+// =============================
+const XP_BONG = 420;
+const XP_DAB = 710;
+const XP_EDDY = 840;
+const XP_JOINT = 840;
+
+const ADD_CRIT_BONG = 0.042;
+const ADD_CRIT_PEN  = 0.021;
+const ADD_CRIT_DAB  = 0.071;
+const ADD_CRIT_EDDY = 0.084;
+const ADD_CRIT_JOINT = 0.042;
+
+const BASE_CRIT_START = 0;
+
+const CRIT_PAYOUT_GENERAL = 4269;
+const CRIT_PAYOUT_DAB = 7100;
 
 // =============================
 // REDIS
@@ -41,12 +58,11 @@ const redis = createClient({
     : undefined,
 });
 
-redis.on("error", (err) => console.error("Redis error:", err));
-redis.on("connect", () => console.log("Redis connecting..."));
-redis.on("ready", () => console.log("Redis ready ✅"));
-
 const DATA_KEY = "bongbot2:data";
+const META_KEY = "bongbot2:meta";
 const ROULETTE_KEY = "bongbot2:roulette";
+
+redis.on("error", console.error);
 
 // =============================
 // DISCORD
@@ -55,38 +71,72 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,   // REQUIRED for prefix commands
-    GatewayIntentBits.GuildVoiceStates // only truly used if music enabled; harmless otherwise
-  ],
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates
+  ]
 });
 
 // =============================
 // DATA MODEL
 // =============================
 let data = {
-  userStats: {
-    // [userId]: { xp, totalRipsAllTime }
-  },
-
-  season: {
-    id: null,
-    start: null,
-    endExclusive: null,
-    active: false
-  },
-
-  seasonStats: {
-    // [userId]: { seasonRips, seasonGambleBet, seasonGambleWon }
-  },
-
-  yearly: {
-    year: null,
-    totals: {
-      // [userId]: { yearRips, yearGambleNet }
-    }
-  }
+  users: {},       // xp, allTimeRips
+  activity: {},    // daily/weekly/monthly/yearly + streak + crit
+  season: { id: null, start: null, endExclusive: null, active: false },
+  seasonStats: {},
+  yearly: { year: null, totals: {} },
+  autoReplyEnabled: AUTO_REPLY_DEFAULT
 };
 
+// =============================
+// TIME (America/Chicago)
+// =============================
+function chicagoDateStr(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Chicago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(d);
+}
+
+function chicagoWeekKey(d = new Date()) {
+  const cd = new Date(d.toLocaleString("en-US", { timeZone: "America/Chicago" }));
+  const day = cd.getDay(); // 0 Sun
+  cd.setDate(cd.getDate() - day);
+  return chicagoDateStr(cd);
+}
+
+function monthKey(d = new Date()) {
+  const s = chicagoDateStr(d);
+  return s.slice(0, 7);
+}
+
+// =============================
+// RESET ON VERSION CHANGE
+// =============================
+async function checkVersionReset() {
+  const raw = await redis.get(META_KEY);
+  const meta = raw ? JSON.parse(raw) : {};
+
+  if (meta.version !== DATA_VERSION) {
+    console.log("🔥 DATA_VERSION changed — wiping XP/activity");
+    data = {
+      users: {},
+      activity: {},
+      season: { id: null, start: null, endExclusive: null, active: false },
+      seasonStats: {},
+      yearly: { year: null, totals: {} },
+      autoReplyEnabled: AUTO_REPLY_DEFAULT
+    };
+    await redis.set(DATA_KEY, JSON.stringify(data));
+    await redis.set(META_KEY, JSON.stringify({ version: DATA_VERSION }));
+  }
+}
+
+// =============================
+// LOAD / SAVE
+// =============================
 async function loadData() {
   const raw = await redis.get(DATA_KEY);
   if (raw) data = JSON.parse(raw);
@@ -96,827 +146,183 @@ async function saveData() {
   await redis.set(DATA_KEY, JSON.stringify(data));
 }
 
-function ensureUser(userId) {
-  if (!data.userStats[userId]) {
-    data.userStats[userId] = { xp: 0, totalRipsAllTime: 0 };
-  }
-  if (!data.seasonStats[userId]) {
-    data.seasonStats[userId] = { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
+// =============================
+// ENSURE USER
+// =============================
+function ensureUser(uid) {
+  if (!data.users[uid]) data.users[uid] = { xp: 0, allTimeRips: 0 };
+
+  if (!data.activity[uid]) {
+    data.activity[uid] = {
+      day: null,
+      daily: 0,
+      week: null,
+      weekly: 0,
+      month: null,
+      monthly: 0,
+      year: null,
+      yearly: 0,
+      streak: 0,
+      critChance: BASE_CRIT_START
+    };
   }
 
   const y = new Date().getFullYear();
   if (!data.yearly.year) data.yearly.year = y;
-  if (data.yearly.year !== y) {
-    data.yearly = { year: y, totals: {} };
-  }
-  if (!data.yearly.totals[userId]) {
-    data.yearly.totals[userId] = { yearRips: 0, yearGambleNet: 0 };
-  }
-}
-
-function isAdmin(member) {
-  return !!member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+  if (!data.yearly.totals[uid]) data.yearly.totals[uid] = { yearRips: 0, yearGambleNet: 0 };
 }
 
 // =============================
-// SEASONS
+// CATEGORY DETECTION
 // =============================
-// January special: Jan 9–15 inclusive => endExclusive Jan 16
-// Other months: days 1–7 => endExclusive day 8
-function getSeasonWindowFor(dateObj) {
-  const y = dateObj.getFullYear();
-  const m = dateObj.getMonth(); // 0-based
-  const monthStr = String(m + 1).padStart(2, "0");
+function detectCategory(msg) {
+  const t = msg.toLowerCase();
 
-  if (m === 0) {
-    const start = `${y}-01-09`;
-    const endExclusive = `${y}-01-16`;
-    return { start, endExclusive, id: `${y}-01@${start}` };
+  if (/fat dabs for jesus|fat dabs|dab rip|dab rips|\bdabs?\b/.test(t))
+    return { name: "DAB", xp: XP_DAB, add: ADD_CRIT_DAB };
+
+  if (/\beddys\b/.test(t))
+    return { name: "EDDYS", xp: XP_EDDY, add: ADD_CRIT_EDDY };
+
+  if (/joint|doobie|doink|smokin a|joint time|doobie time|doink30/.test(t))
+    return { name: "JOINT", xp: XP_JOINT, add: ADD_CRIT_JOINT };
+
+  if (/pen rip|pen rips|penjamin/.test(t))
+    return { name: "PEN", xp: XP_BONG, add: ADD_CRIT_PEN };
+
+  if (/rip|rips|bong|zong|zonk|dong|get high|light up|smoke/.test(t))
+    return { name: "RIP", xp: XP_BONG, add: ADD_CRIT_BONG };
+
+  return null;
+}
+
+// =============================
+// CRIT ROLL (ADD ONLY)
+// =============================
+function rollCrit(state, add) {
+  const chanceBefore = state.critChance;
+  const rollChance = Math.min(1, Math.max(0, chanceBefore));
+  const hit = Math.random() < rollChance;
+
+  if (hit) {
+    state.critChance = BASE_CRIT_START;
+  } else {
+    state.critChance += add;
   }
 
-  const start = `${y}-${monthStr}-01`;
-  const endExclusive = `${y}-${monthStr}-08`;
-  return { start, endExclusive, id: `${y}-${monthStr}@${start}` };
-}
-
-function yyyyMmDd(dateObj = new Date()) {
-  return dateObj.toISOString().slice(0, 10);
-}
-
-function isDateInWindow(dateStr, startStr, endExclusiveStr) {
-  return dateStr >= startStr && dateStr < endExclusiveStr;
-}
-
-function getSeasonNet(uid) {
-  const s = data.seasonStats[uid] || { seasonGambleBet: 0, seasonGambleWon: 0 };
-  return (s.seasonGambleWon || 0) - (s.seasonGambleBet || 0);
-}
-
-async function announceSeasonWinners() {
-  const channel = client.channels.cache.get(ALERT_CHANNEL_ID);
-  if (!channel) return;
-
-  const entries = Object.entries(data.seasonStats);
-  if (!entries.length) {
-    await channel.send("🏁 **Season ended!** No season stats were recorded this season.");
-    return;
-  }
-
-  const ripSorted = [...entries].sort((a, b) => (b[1].seasonRips || 0) - (a[1].seasonRips || 0));
-  const [ripWinnerId, ripWinnerStats] = ripSorted[0];
-
-  const xpSorted = [...entries].sort((a, b) => getSeasonNet(b[0]) - getSeasonNet(a[0]));
-  const [xpWinnerId] = xpSorted[0];
-  const xpWinnerNet = getSeasonNet(xpWinnerId);
-
-  await channel.send(
-    "🏁 **SEASON COMPLETE** 🏁\n" +
-      `🥇 **RIP WINNER:** <@${ripWinnerId}> — **${ripWinnerStats.seasonRips || 0} rips**\n` +
-      `💰 **XP (GAMBLING NET) WINNER:** <@${xpWinnerId}> — **${xpWinnerNet} net XP**\n` +
-      `📌 Use \`!seasonboard\` to see standings and \`!yearboard\` for yearly totals.`
-  );
-}
-
-async function maybeUpdateSeasonAndFinalizeIfNeeded() {
-  const today = yyyyMmDd(new Date());
-  const window = getSeasonWindowFor(new Date());
-  const currentlyActive = isDateInWindow(today, window.start, window.endExclusive);
-
-  if (!data.season.id) {
-    data.season = { ...window, active: currentlyActive };
-    await saveData();
-    return;
-  }
-
-  const seasonIdChanged = data.season.id !== window.id;
-
-  if ((data.season.active && !currentlyActive) || seasonIdChanged) {
-    // finalize old season
-    await announceSeasonWinners();
-
-    // roll into yearly totals
-    for (const [uid, s] of Object.entries(data.seasonStats)) {
-      ensureUser(uid);
-      const net = (s.seasonGambleWon || 0) - (s.seasonGambleBet || 0);
-      data.yearly.totals[uid].yearRips += (s.seasonRips || 0);
-      data.yearly.totals[uid].yearGambleNet += net;
-    }
-
-    // reset season stats for next season
-    data.seasonStats = {};
-  }
-
-  data.season = { ...window, active: currentlyActive };
-  await saveData();
+  return { hit, used: chanceBefore };
 }
 
 // =============================
-// RIP DETECTION
+// COMMAND REGISTRY
 // =============================
-function messageHasRip(content) {
-  const txt = content.toLowerCase();
-  return (
-    /\brips?\b/.test(txt) ||
-    txt.includes("bong") ||
-    txt.includes("dab") ||
-    txt.includes("doobie") ||
-    txt.includes("joint") ||
-    txt.includes("doink") ||
-    txt.includes("eddys") ||
-    txt.includes("penjamin") ||
-    txt.includes("pen rip") ||
-    txt.includes("zong") ||
-    txt.includes("zonk") ||
-    txt.includes("dong")
-  );
-}
-
-// =============================
-// ROULETTE (American wheel)
-// =============================
-const WHEEL = [
-  "0","00","1","2","3","4","5","6","7","8","9","10",
-  "11","12","13","14","15","16","17","18","19","20",
-  "21","22","23","24","25","26","27","28","29","30",
-  "31","32","33","34","35","36"
+const COMMANDS = [
+  "!commands","!help <cmd>","!ping","!version","!uptime",
+  "!ripstats","!crit","!season","!seasonboard","!yearboard",
+  "!mostrips","!toprippers",
+  "!red <bet>","!black <bet>","!number <n|00> <bet>","!roulette",
+  "!addexp @user <amt>","!addrips @user <amt>","!toggleautoreply"
 ];
-
-const RED_NUMS = new Set(["1","3","5","7","9","12","14","16","18","19","21","23","25","27","30","32","34","36"]);
-function getColor(num) {
-  if (num === "0" || num === "00") return "green";
-  return RED_NUMS.has(num) ? "red" : "black";
-}
-
-function pickSpin() {
-  const num = WHEEL[Math.floor(Math.random() * WHEEL.length)];
-  return { num, color: getColor(num) };
-}
-
-async function getRouletteRound() {
-  const raw = await redis.get(ROULETTE_KEY);
-  return raw ? JSON.parse(raw) : null;
-}
-
-async function setRouletteRound(obj) {
-  await redis.set(ROULETTE_KEY, JSON.stringify(obj));
-}
-
-async function clearRouletteRound() {
-  await redis.del(ROULETTE_KEY);
-}
-
-async function ensureRouletteTimer() {
-  const round = await getRouletteRound();
-  if (!round) return;
-
-  const msLeft = round.endTime - Date.now();
-  if (msLeft <= 0) {
-    await resolveRouletteRound();
-    return;
-  }
-
-  setTimeout(async () => {
-    await resolveRouletteRound();
-  }, msLeft);
-}
-
-async function startRouletteIfNeeded(channelId) {
-  const existing = await getRouletteRound();
-  if (existing) return existing;
-
-  const round = {
-    channelId,
-    startTime: Date.now(),
-    endTime: Date.now() + ROULETTE_WINDOW_MS,
-    bets: [] // { userId, type, pick, amount }
-  };
-
-  await setRouletteRound(round);
-
-  const channel = client.channels.cache.get(channelId);
-  if (channel) {
-    await channel.send(
-      `🎰 **ROULETTE OPEN** — You have **90 seconds** to bet!\n` +
-        `Commands:\n` +
-        `• \`!red <bet>\`\n` +
-        `• \`!black <bet>\`\n` +
-        `• \`!number <0-36|00> <bet>\`\n` +
-        `Min bet: **${MIN_BET} XP**`
-    );
-  }
-
-  setTimeout(async () => {
-    await resolveRouletteRound();
-  }, ROULETTE_WINDOW_MS);
-
-  return round;
-}
-
-function calcPayout(bet, spin) {
-  if (bet.type === "red" || bet.type === "black") {
-    if (spin.color === bet.type) return bet.amount * 2;
-    return 0;
-  }
-  if (bet.type === "number") {
-    if (spin.num === bet.pick) return bet.amount * 36;
-    return 0;
-  }
-  return 0;
-}
-
-async function placeBet({ userId, channelId, type, pick, amount }) {
-  if (amount < MIN_BET) {
-    return { ok: false, msg: `Min bet is **${MIN_BET} XP**.` };
-  }
-
-  ensureUser(userId);
-
-  if (data.userStats[userId].xp < amount) {
-    return { ok: false, msg: `You only have **${data.userStats[userId].xp} XP**.` };
-  }
-
-  // escrow immediately
-  data.userStats[userId].xp -= amount;
-
-  // track season gambling
-  if (!data.seasonStats[userId]) data.seasonStats[userId] = { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
-  data.seasonStats[userId].seasonGambleBet += amount;
-
-  await saveData();
-
-  const round = await startRouletteIfNeeded(channelId);
-  round.bets.push({ userId, type, pick, amount });
-  await setRouletteRound(round);
-
-  const secondsLeft = Math.max(0, Math.ceil((round.endTime - Date.now()) / 1000));
-  return {
-    ok: true,
-    msg: `✅ Bet placed: **${amount} XP** on **${type === "number" ? `number ${pick}` : type}**. (⏳ ~${secondsLeft}s left)`
-  };
-}
-
-async function resolveRouletteRound() {
-  const round = await getRouletteRound();
-  if (!round) return;
-
-  await clearRouletteRound();
-
-  const channel = client.channels.cache.get(round.channelId);
-  const spin = pickSpin();
-
-  if (!round.bets || round.bets.length === 0) {
-    if (channel) {
-      await channel.send(`🎰 Roulette closed. Spin: **${spin.num} ${spin.color.toUpperCase()}** (no bets placed)`);
-    }
-    return;
-  }
-
-  const perUser = new Map();
-  for (const b of round.bets) {
-    const payout = calcPayout(b, spin);
-    const cur = perUser.get(b.userId) || { betTotal: 0, winTotal: 0, betCount: 0 };
-    cur.betTotal += b.amount;
-    cur.winTotal += payout;
-    cur.betCount += 1;
-    perUser.set(b.userId, cur);
-  }
-
-  // apply payouts
-  for (const [uid, totals] of perUser.entries()) {
-    ensureUser(uid);
-    if (!data.seasonStats[uid]) data.seasonStats[uid] = { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
-
-    if (totals.winTotal > 0) {
-      data.userStats[uid].xp += totals.winTotal;
-      data.seasonStats[uid].seasonGambleWon += totals.winTotal;
-    }
-  }
-
-  await saveData();
-
-  if (channel) {
-    let summary = `🎰 **ROULETTE RESULT**: **${spin.num} ${spin.color.toUpperCase()}**\n`;
-
-    const results = [...perUser.entries()]
-      .map(([uid, t]) => ({ uid, net: t.winTotal - t.betTotal, betTotal: t.betTotal, winTotal: t.winTotal }))
-      .sort((a, b) => b.net - a.net);
-
-    const lines = results.slice(0, 10).map((r, i) => {
-      const sign = r.net >= 0 ? "+" : "";
-      return `**${i + 1}.** <@${r.uid}> — net **${sign}${r.net} XP** (bet ${r.betTotal}, paid ${r.winTotal})`;
-    });
-
-    summary += `\n🏆 **Round net results:**\n${lines.join("\n")}`;
-    await channel.send(summary);
-  }
-}
-
-// =============================
-// LEADERBOARDS
-// =============================
-function topSeasonRips(limit = 10) {
-  const entries = Object.entries(data.seasonStats || {});
-  return entries
-    .map(([uid, s]) => ({ uid, val: s.seasonRips || 0 }))
-    .sort((a, b) => b.val - a.val)
-    .slice(0, limit);
-}
-
-function topSeasonNet(limit = 10) {
-  const entries = Object.keys(data.seasonStats || {});
-  return entries
-    .map((uid) => ({ uid, val: getSeasonNet(uid) }))
-    .sort((a, b) => b.val - a.val)
-    .slice(0, limit);
-}
-
-function topYearRips(limit = 10) {
-  const entries = Object.entries(data.yearly?.totals || {});
-  return entries
-    .map(([uid, t]) => ({ uid, val: t.yearRips || 0 }))
-    .sort((a, b) => b.val - a.val)
-    .slice(0, limit);
-}
-
-function topYearNet(limit = 10) {
-  const entries = Object.entries(data.yearly?.totals || {});
-  return entries
-    .map(([uid, t]) => ({ uid, val: t.yearGambleNet || 0 }))
-    .sort((a, b) => b.val - a.val)
-    .slice(0, limit);
-}
-
-// =============================
-// MUSIC (QUICK / UNSTABLE) — ENABLED BY FLAG
-// =============================
-let joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior;
-let getVoiceConnection, entersState, VoiceConnectionStatus, StreamType;
-let playdl;
-let musicState;
-
-function isMusicCommand(cmd) {
-  return ["play","skip","stop","pause","resume","queue","leave","voicecheck"].includes(cmd);
-}
-
-if (ENABLE_MUSIC) {
-  const ffmpegPath = require("ffmpeg-static");
-  process.env.FFMPEG_PATH = ffmpegPath;
-
-  ({
-    joinVoiceChannel,
-    createAudioPlayer,
-    createAudioResource,
-    AudioPlayerStatus,
-    NoSubscriberBehavior,
-    getVoiceConnection,
-    entersState,
-    VoiceConnectionStatus,
-    StreamType
-  } = require("@discordjs/voice"));
-
-  playdl = require("play-dl");
-
-  // In-memory per-guild queue (resets on restart, OK)
-  musicState = new Map(); // guildId -> { connection, player, queue: [{title,url}], playing: bool, textChannelId }
-
-  function getGuildState(guildId) {
-    if (!musicState.has(guildId)) {
-      const player = createAudioPlayer({
-        behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
-      });
-
-      const state = { connection: null, player, queue: [], playing: false, textChannelId: null };
-      musicState.set(guildId, state);
-
-      player.on(AudioPlayerStatus.Idle, async () => {
-        state.playing = false;
-        await playNext(guildId);
-      });
-
-      player.on("error", async (err) => {
-        console.error("Audio player error:", err);
-        state.playing = false;
-        await playNext(guildId);
-      });
-    }
-    return musicState.get(guildId);
-  }
-
-  async function connectToUserVC(msg) {
-    const member = msg.member;
-    const voiceChannel = member?.voice?.channel;
-    if (!voiceChannel) {
-      await msg.reply("🎧 You need to join a voice channel first.");
-      return null;
-    }
-
-    const guildId = msg.guild.id;
-    const state = getGuildState(guildId);
-    state.textChannelId = msg.channel.id;
-
-    const existing = getVoiceConnection(guildId);
-    if (existing) {
-      state.connection = existing;
-      return state;
-    }
-
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId,
-      adapterCreator: msg.guild.voiceAdapterCreator,
-      selfDeaf: true
-    });
-
-    state.connection = connection;
-
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-    } catch (e) {
-      console.error("Voice connect failed:", e);
-      try { connection.destroy(); } catch {}
-      state.connection = null;
-      await msg.reply("❌ Couldn’t join voice. Check bot permissions + try again.");
-      return null;
-    }
-
-    connection.subscribe(state.player);
-    return state;
-  }
-
-  function looksLikeUrl(s) {
-    return /^https?:\/\/\S+/i.test(s);
-  }
-
-  async function resolveTrack(query) {
-    if (looksLikeUrl(query)) {
-      try {
-        const info = await playdl.video_basic_info(query).catch(() => null);
-        if (info?.video_details?.title) return { title: info.video_details.title, url: query };
-      } catch {}
-      return { title: query, url: query };
-    }
-
-    const results = await playdl.search(query, { limit: 1 });
-    if (!results || results.length === 0) return null;
-    return { title: results[0].title || query, url: results[0].url };
-  }
-
-  async function playNext(guildId) {
-    const state = getGuildState(guildId);
-    if (state.playing) return;
-    if (!state.connection) return;
-    if (!state.queue.length) return;
-
-    const next = state.queue.shift();
-    state.playing = true;
-
-    try {
-      const stream = await playdl.stream(next.url, { quality: 2 });
-      const resource = createAudioResource(stream.stream, {
-        inputType: stream.type === "opus" ? StreamType.OggOpus : StreamType.Arbitrary
-      });
-
-      state.player.play(resource);
-
-      if (state.textChannelId) {
-        const channel = client.channels.cache.get(state.textChannelId);
-        if (channel) channel.send(`🎶 Now playing: **${next.title}**`);
-      }
-    } catch (e) {
-      console.error("Play failed:", e);
-      state.playing = false;
-
-      if (state.textChannelId) {
-        const channel = client.channels.cache.get(state.textChannelId);
-        if (channel) channel.send("❌ That track failed (YouTube/SoundCloud sometimes blocks). Try another link/search.");
-      }
-
-      await playNext(guildId);
-    }
-  }
-
-  // Expose inside handler scope:
-  global.__music = { getGuildState, connectToUserVC, resolveTrack, playNext };
-}
-
-// =============================
-// READY
-// =============================
-client.on("ready", async () => {
-  console.log(`🔥 BongBot 2.0 online as ${client.user.tag}`);
-
-  // tick season updates every 10 min
-  setInterval(async () => {
-    try {
-      await loadData();
-      await maybeUpdateSeasonAndFinalizeIfNeeded();
-    } catch (e) {
-      console.error("season tick error:", e);
-    }
-  }, 10 * 60 * 1000);
-});
 
 // =============================
 // MESSAGE HANDLER
 // =============================
+const lastReplyAt = new Map();
+const START_TIME = Date.now();
+
 client.on("messageCreate", async (msg) => {
-  try {
-    if (msg.author.bot) return;
+  if (msg.author.bot) return;
+  await loadData();
 
-    await loadData();
+  const raw = msg.content.trim();
+  const content = raw.toLowerCase();
+  const uid = msg.author.id;
 
-    const raw = msg.content.trim();
-    const content = raw.toLowerCase();
-    const userId = msg.author.id;
+  ensureUser(uid);
 
-    // Basic debug command (helps instantly verify pipeline)
-    if (content === "!ping") return msg.reply("pong ✅");
-
-    // Parse command token for music gating
-    let cmdToken = "";
-    if (content.startsWith("!")) cmdToken = content.slice(1).split(/\s+/)[0];
-
-    if (!ENABLE_MUSIC && cmdToken && isMusicCommand(cmdToken)) {
-      return msg.reply("🎵 Music is temporarily disabled. (Set `ENABLE_MUSIC=true` to enable.)");
-    }
-
-    ensureUser(userId);
-
-    // ---- Season info ----
-    if (content === "!season") {
-      const s = data.season;
-      return msg.reply(
-        `🗓️ **Season Info**\n` +
-          `Season ID: **${s.id || "unknown"}**\n` +
-          `Window: **${s.start || "?"}** → **${s.endExclusive || "?"}** (end is exclusive)\n` +
-          `Active right now: **${s.active ? "YES ✅" : "NO ❌"}**`
-      );
-    }
-
-    if (content === "!seasonboard") {
-      const rip = topSeasonRips(10);
-      const net = topSeasonNet(10);
-
-      const ripLines = rip.length
-        ? rip.map((r, i) => `**${i + 1}.** <@${r.uid}> — **${r.val} rips**`).join("\n")
-        : "_No season rips yet._";
-
-      const netLines = net.length
-        ? net
-            .map((r, i) => {
-              const sign = r.val >= 0 ? "+" : "";
-              return `**${i + 1}.** <@${r.uid}> — **${sign}${r.val} net XP**`;
-            })
-            .join("\n")
-        : "_No season gambling yet._";
-
-      return msg.reply(
-        `🏁 **Season Leaderboards** (Season: ${data.season.id})\n\n` +
-          `💨 **Top Season Rips**\n${ripLines}\n\n` +
-          `🎰 **Top Season Gambling Net XP**\n${netLines}`
-      );
-    }
-
-    if (content === "!yearboard") {
-      const yr = data.yearly?.year || new Date().getFullYear();
-      const rip = topYearRips(10);
-      const net = topYearNet(10);
-
-      const ripLines = rip.length
-        ? rip.map((r, i) => `**${i + 1}.** <@${r.uid}> — **${r.val} rips**`).join("\n")
-        : "_No yearly totals yet._";
-
-      const netLines = net.length
-        ? net
-            .map((r, i) => {
-              const sign = r.val >= 0 ? "+" : "";
-              return `**${i + 1}.** <@${r.uid}> — **${sign}${r.val} net XP**`;
-            })
-            .join("\n")
-        : "_No yearly gambling totals yet._";
-
-      return msg.reply(
-        `📅 **Yearly Leaderboards (${yr})**\n\n` +
-          `💨 **Year Rips (sum of seasons)**\n${ripLines}\n\n` +
-          `🎰 **Year Gambling Net XP (sum of seasons)**\n${netLines}`
-      );
-    }
-
-    // ---- Personal stats ----
-    if (content === "!ripstats") {
-      const u = data.userStats[userId];
-      const s = data.seasonStats[userId] || { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
-      const net = (s.seasonGambleWon || 0) - (s.seasonGambleBet || 0);
-
-      return msg.reply(
-        `👤 **Your Stats**\n` +
-          `XP: **${u.xp}**\n` +
-          `All-time rips: **${u.totalRipsAllTime}**\n\n` +
-          `🏁 **This Season (${data.season.id})**\n` +
-          `Season rips: **${s.seasonRips || 0}**\n` +
-          `Season gambling net: **${net} XP**`
-      );
-    }
-
-    // ---- Admin restore ----
-    if (content.startsWith("!addexp")) {
-      if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
-      const target = msg.mentions.users.first();
-      const parts = raw.split(/\s+/);
-      const amt = parseInt(parts[2], 10);
-      if (!target || isNaN(amt)) return msg.reply("Usage: `!addexp @user <amount>`");
-
-      ensureUser(target.id);
-      data.userStats[target.id].xp = Math.max(0, data.userStats[target.id].xp + amt);
-      await saveData();
-      return msg.reply(`✅ Added **${amt} XP** to <@${target.id}>. Now **${data.userStats[target.id].xp} XP**.`);
-    }
-
-    if (content.startsWith("!addrips")) {
-      if (!isAdmin(msg.member)) return msg.reply("🚫 Admins only.");
-      const target = msg.mentions.users.first();
-      const parts = raw.split(/\s+/);
-      const amt = parseInt(parts[2], 10);
-      if (!target || isNaN(amt) || amt <= 0) return msg.reply("Usage: `!addrips @user <amount>`");
-
-      ensureUser(target.id);
-      data.userStats[target.id].totalRipsAllTime += amt;
-      await saveData();
-      return msg.reply(`✅ Added **${amt} total rips** to <@${target.id}>.`);
-    }
-
-    // =============================
-    // ROULETTE
-    // =============================
-    if (content.startsWith("!red ")) {
-      const parts = raw.split(/\s+/);
-      const amt = parseInt(parts[1], 10);
-      if (isNaN(amt)) return msg.reply("Usage: `!red <bet>`");
-
-      const res = await placeBet({ userId, channelId: msg.channel.id, type: "red", pick: "red", amount: amt });
-      return msg.reply(res.msg);
-    }
-
-    if (content.startsWith("!black ")) {
-      const parts = raw.split(/\s+/);
-      const amt = parseInt(parts[1], 10);
-      if (isNaN(amt)) return msg.reply("Usage: `!black <bet>`");
-
-      const res = await placeBet({ userId, channelId: msg.channel.id, type: "black", pick: "black", amount: amt });
-      return msg.reply(res.msg);
-    }
-
-    if (content.startsWith("!number ")) {
-      const parts = raw.split(/\s+/);
-      const pick = (parts[1] || "").toString();
-      const amt = parseInt(parts[2], 10);
-
-      const validPick = pick === "00" || (/^\d+$/.test(pick) && Number(pick) >= 0 && Number(pick) <= 36);
-      if (!validPick || isNaN(amt)) return msg.reply("Usage: `!number <0-36|00> <bet>`");
-
-      const res = await placeBet({ userId, channelId: msg.channel.id, type: "number", pick, amount: amt });
-      return msg.reply(res.msg);
-    }
-
-    if (content === "!roulette") {
-      const round = await getRouletteRound();
-      if (!round) return msg.reply("🎰 No active roulette round. Place a bet with `!red`, `!black`, or `!number`.");
-      const secondsLeft = Math.max(0, Math.ceil((round.endTime - Date.now()) / 1000));
-      return msg.reply(`🎰 Roulette is open — **${secondsLeft}s** left. Bets so far: **${round.bets.length}**`);
-    }
-
-    // =============================
-    // MUSIC COMMANDS (only if enabled)
-    // =============================
-    if (ENABLE_MUSIC && content.startsWith("!voicecheck")) {
-      const vc = msg.member?.voice?.channel;
-      const me = msg.guild?.members?.me;
-
-      const lines = [];
-      lines.push(`ENABLE_MUSIC: **true**`);
-      lines.push(`FFMPEG_PATH set: **${process.env.FFMPEG_PATH ? "YES" : "NO"}**`);
-      lines.push(`You in VC: **${vc ? vc.name : "NO"}**`);
-
-      if (vc && me) {
-        const perms = vc.permissionsFor(me);
-        lines.push(`Bot can CONNECT: **${perms?.has(PermissionsBitField.Flags.Connect) ? "YES" : "NO"}**`);
-        lines.push(`Bot can SPEAK: **${perms?.has(PermissionsBitField.Flags.Speak) ? "YES" : "NO"}**`);
-      }
-
-      return msg.reply("🔎 **VoiceCheck**\n" + lines.join("\n"));
-    }
-
-    if (ENABLE_MUSIC && content.startsWith("!play ")) {
-      const query = raw.slice("!play ".length).trim();
-      if (!query) return msg.reply("Usage: `!play <youtube url | soundcloud url | search terms>`");
-
-      const { connectToUserVC, resolveTrack, playNext } = global.__music;
-
-      const state = await connectToUserVC(msg);
-      if (!state) return;
-
-      const track = await resolveTrack(query);
-      if (!track) return msg.reply("❌ Couldn’t find anything for that search.");
-
-      state.queue.push(track);
-      await msg.reply(`✅ Queued: **${track.title}**`);
-
-      if (!state.playing) await playNext(msg.guild.id);
-      return;
-    }
-
-    if (ENABLE_MUSIC && content === "!skip") {
-      const { getGuildState } = global.__music;
-      const state = getGuildState(msg.guild.id);
-      if (!state.connection) return msg.reply("❌ I’m not in a voice channel.");
-      state.player.stop(true);
-      return msg.reply("⏭️ Skipped.");
-    }
-
-    if (ENABLE_MUSIC && content === "!stop") {
-      const { getGuildState } = global.__music;
-      const state = getGuildState(msg.guild.id);
-      state.queue = [];
-      if (state.player) state.player.stop(true);
-      return msg.reply("🛑 Stopped and cleared the queue.");
-    }
-
-    if (ENABLE_MUSIC && content === "!pause") {
-      const { getGuildState } = global.__music;
-      const state = getGuildState(msg.guild.id);
-      if (!state.player) return msg.reply("❌ Nothing playing.");
-      state.player.pause();
-      return msg.reply("⏸️ Paused.");
-    }
-
-    if (ENABLE_MUSIC && content === "!resume") {
-      const { getGuildState } = global.__music;
-      const state = getGuildState(msg.guild.id);
-      if (!state.player) return msg.reply("❌ Nothing playing.");
-      state.player.unpause();
-      return msg.reply("▶️ Resumed.");
-    }
-
-    if (ENABLE_MUSIC && content === "!queue") {
-      const { getGuildState } = global.__music;
-      const state = getGuildState(msg.guild.id);
-      if (!state.queue.length) return msg.reply("📭 Queue is empty.");
-      const lines = state.queue.slice(0, 10).map((t, i) => `**${i + 1}.** ${t.title}`);
-      return msg.reply(`📜 **Queue**\n${lines.join("\n")}`);
-    }
-
-    if (ENABLE_MUSIC && content === "!leave") {
-      const conn = getVoiceConnection(msg.guild.id);
-      if (conn) conn.destroy();
-
-      const { getGuildState } = global.__music;
-      const state = getGuildState(msg.guild.id);
-      state.queue = [];
-      state.playing = false;
-      state.connection = null;
-
-      return msg.reply("👋 Left voice and cleared the queue.");
-    }
-
-    // =============================
-    // RIP COUNTING (ONLY DURING SEASON)
-    // =============================
-    if (messageHasRip(content)) {
-      data.userStats[userId].totalRipsAllTime += 1;
-
-      if (data.season.active) {
-        if (!data.seasonStats[userId]) data.seasonStats[userId] = { seasonRips: 0, seasonGambleBet: 0, seasonGambleWon: 0 };
-        data.seasonStats[userId].seasonRips += 1;
-
-        await saveData();
-        return;
-      }
-
-      await saveData();
-      return;
-    }
-
-    // no-op message; don't spam Redis writes
-    // (we still loaded data above, but we won't save unless something changed)
-  } catch (e) {
-    console.error("messageCreate handler error:", e);
-    try { await msg.reply("❌ Internal error (check Railway logs)."); } catch {}
+  // -------- BASIC COMMANDS --------
+  if (content === "!ping") return msg.reply("pong ✅");
+  if (content === "!version") return msg.reply(`BongBot v${BOT_VERSION}`);
+  if (content === "!uptime") {
+    const mins = Math.floor((Date.now() - START_TIME) / 60000);
+    return msg.reply(`⏱️ Uptime: ${mins} min`);
   }
+
+  if (content === "!commands")
+    return msg.reply(`📜 **Commands**\n${COMMANDS.map(c => `• ${c}`).join("\n")}`);
+
+  if (content.startsWith("!help"))
+    return msg.reply("ℹ️ Use `!commands` to see everything.");
+
+  if (content === "!toggleautoreply") {
+    if (!msg.member.permissions.has(PermissionsBitField.Flags.Administrator))
+      return msg.reply("Admins only.");
+    data.autoReplyEnabled = !data.autoReplyEnabled;
+    await saveData();
+    return msg.reply(`Auto replies: **${data.autoReplyEnabled ? "ON" : "OFF"}**`);
+  }
+
+  if (content === "!crit") {
+    const a = data.activity[uid];
+    return msg.reply(
+      `🎯 Crit chance: **${(a.critChance * 100).toFixed(2)}%**\n` +
+      `Adds → Bong +4.20 | Pen +2.10 | Dab +7.10 | Eddys +8.40 | Joint +4.20`
+    );
+  }
+
+  // -------- RIP HANDLING --------
+  const cat = detectCategory(content);
+  if (!cat) return;
+
+  const a = data.activity[uid];
+  const u = data.users[uid];
+
+  const today = chicagoDateStr();
+  const wk = chicagoWeekKey();
+  const mo = monthKey();
+  const yr = new Date().getFullYear();
+
+  if (a.day !== today) {
+    a.day = today;
+    a.daily = 0;
+    a.streak += 1;
+  }
+  if (a.week !== wk) { a.week = wk; a.weekly = 0; }
+  if (a.month !== mo) { a.month = mo; a.monthly = 0; }
+  if (a.year !== yr) { a.year = yr; a.yearly = 0; }
+
+  a.daily++; a.weekly++; a.monthly++; a.yearly++;
+  u.allTimeRips++;
+
+  const crit = rollCrit(a, cat.add);
+  let xp = cat.xp;
+  if (crit.hit) xp = cat.name === "DAB" ? CRIT_PAYOUT_DAB : CRIT_PAYOUT_GENERAL;
+
+  u.xp += xp;
+
+  await saveData();
+
+  // Auto reply (cooldown)
+  if (!data.autoReplyEnabled) return;
+  const last = lastReplyAt.get(uid) || 0;
+  if (Date.now() - last < AUTO_REPLY_COOLDOWN_MS) return;
+  lastReplyAt.set(uid, Date.now());
+
+  return msg.reply(
+    `💨 **${cat.name} REGISTERED**\n` +
+    `🎯 Crit used: ${(crit.used * 100).toFixed(2)}%\n` +
+    (crit.hit ? "💥 **CRIT HIT!**\n" : "") +
+    `💰 +${xp} XP | Total XP: ${u.xp}\n` +
+    `🔥 Streak: ${a.streak} | Today: ${a.daily}`
+  );
 });
 
 // =============================
 // STARTUP
 // =============================
 (async () => {
-  try {
-    await redis.connect();
-    await loadData();
-    await maybeUpdateSeasonAndFinalizeIfNeeded();
-    await ensureRouletteTimer();
-
-    await client.login(process.env.BOT_TOKEN);
-  } catch (err) {
-    console.error("Startup failed:", err);
-    process.exit(1);
-  }
+  await redis.connect();
+  await checkVersionReset();
+  await loadData();
+  await client.login(process.env.BOT_TOKEN);
 })();
